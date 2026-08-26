@@ -14,7 +14,7 @@ use crate::github::GitHubClient;
 use crate::installer;
 use crate::models::{
     AppSnapshot, InstallationSnapshot, OperationEvent, OperationRequest, OperationResult,
-    Preferences, current_platform,
+    Preferences, current_platform, resolve_language,
 };
 use crate::storage;
 
@@ -50,6 +50,9 @@ impl Drop for OperationState {
 #[tauri::command]
 pub async fn get_app_snapshot(app: AppHandle) -> AppResult<AppSnapshot> {
     let mut preferences = storage::load_preferences(&app).await?;
+    preferences.steam_language = resolve_language(&preferences.steam_language)
+        .steam_language
+        .into();
     let launcher_directory = storage::default_install_directory()?;
     let launcher_is_in_installation =
         storage::is_existing_installation_directory(Path::new(&launcher_directory));
@@ -95,7 +98,10 @@ pub async fn inspect_installation(install_directory: String) -> AppResult<Instal
 }
 
 #[tauri::command]
-pub async fn save_preferences(app: AppHandle, preferences: Preferences) -> AppResult<()> {
+pub async fn save_preferences(app: AppHandle, mut preferences: Preferences) -> AppResult<()> {
+    preferences.steam_language = resolve_language(&preferences.steam_language)
+        .steam_language
+        .into();
     storage::save_preferences(&app, &preferences).await
 }
 
@@ -124,6 +130,9 @@ pub async fn run_operation(
     let preferences = Preferences {
         install_directory: request.install_directory.clone(),
         steam_username: request.steam_username.clone(),
+        steam_language: resolve_language(&request.steam_language)
+            .steam_language
+            .into(),
         auth_method: request.auth_method,
     };
     let result = async {

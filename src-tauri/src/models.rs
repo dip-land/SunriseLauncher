@@ -9,18 +9,121 @@ pub const MOD_RELATIVE_PATH: [&str; 3] = ["bin", "x64", "steam_api64.dll"];
 pub const FRESH_INSTALL_BYTES: u64 = 110 * 1024 * 1024 * 1024;
 pub const REPAIR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const UPDATE_BYTES: u64 = 256 * 1024 * 1024;
-pub const DEPOTS: [(u32, u64); 2] = [
-    (1_085_661, 7_180_122_903_232_116_872),
-    (1_085_662, 2_210_332_166_360_342_287),
+pub const BASE_DEPOT: DepotSpec = DepotSpec::new(1_085_661, 7_180_122_903_232_116_872);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepotSpec {
+    pub depot_id: u32,
+    pub manifest_id: u64,
+}
+
+impl DepotSpec {
+    pub const fn new(depot_id: u32, manifest_id: u64) -> Self {
+        Self {
+            depot_id,
+            manifest_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LanguageSpec {
+    pub display_name: &'static str,
+    pub steam_language: &'static str,
+    pub depot: DepotSpec,
+}
+
+impl LanguageSpec {
+    pub const fn new(
+        display_name: &'static str,
+        steam_language: &'static str,
+        depot_id: u32,
+        manifest_id: u64,
+    ) -> Self {
+        Self {
+            display_name,
+            steam_language,
+            depot: DepotSpec::new(depot_id, manifest_id),
+        }
+    }
+}
+
+pub const LANGUAGES: [LanguageSpec; 13] = [
+    LanguageSpec::new("English", "english", 1_085_662, 2_210_332_166_360_342_287),
+    LanguageSpec::new("French", "french", 1_085_663, 2_934_940_253_687_559_290),
+    LanguageSpec::new("German", "german", 1_085_664, 2_207_989_571_290_186_153),
+    LanguageSpec::new("Italian", "italian", 1_085_665, 6_668_232_053_215_128_229),
+    LanguageSpec::new("Japanese", "japanese", 1_085_666, 7_430_022_397_683_116_838),
+    LanguageSpec::new(
+        "Portuguese (Brazil)",
+        "brazilian",
+        1_085_667,
+        9_037_238_175_838_085_860,
+    ),
+    LanguageSpec::new(
+        "Spanish (Spain)",
+        "spanish",
+        1_085_668,
+        3_424_833_900_894_552_134,
+    ),
+    LanguageSpec::new("Russian", "russian", 1_085_669, 4_539_277_942_371_480_381),
+    LanguageSpec::new("Polish", "polish", 1_085_670, 6_407_581_507_105_256_731),
+    LanguageSpec::new(
+        "Chinese (Simplified)",
+        "schinese",
+        1_085_671,
+        4_397_663_774_546_719_308,
+    ),
+    LanguageSpec::new(
+        "Chinese (Traditional)",
+        "tchinese",
+        1_085_672,
+        3_906_738_704_604_711_877,
+    ),
+    LanguageSpec::new(
+        "Spanish (Latin America)",
+        "latam",
+        1_085_673,
+        4_773_170_998_099_699_561,
+    ),
+    LanguageSpec::new("Korean", "koreana", 1_085_674, 7_148_196_199_569_436_690),
 ];
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub fn resolve_language(steam_language: &str) -> &'static LanguageSpec {
+    LANGUAGES
+        .iter()
+        .find(|language| {
+            language
+                .steam_language
+                .eq_ignore_ascii_case(steam_language.trim())
+        })
+        .unwrap_or(&LANGUAGES[0])
+}
+
+pub fn depots_for(language: &LanguageSpec) -> [DepotSpec; 2] {
+    [BASE_DEPOT, language.depot]
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
     pub install_directory: String,
     pub steam_username: String,
+    #[serde(default = "default_steam_language")]
+    pub steam_language: String,
     #[serde(default)]
     pub auth_method: AuthMethod,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            install_directory: String::new(),
+            steam_username: String::new(),
+            steam_language: default_steam_language(),
+            auth_method: AuthMethod::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -63,15 +166,21 @@ pub struct InstallerState {
     pub release_asset_digest: Option<String>,
     pub installed_dll_sha256: String,
     pub installed_at_utc: DateTime<Utc>,
+    #[serde(default = "default_steam_language")]
+    pub steam_language: String,
     pub manifests: BTreeMap<u32, u64>,
 }
 
 fn schema_version() -> u8 {
-    1
+    2
 }
 
 fn steam_app_id() -> u32 {
     STEAM_APP_ID
+}
+
+fn default_steam_language() -> String {
+    "english".into()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -152,6 +261,8 @@ pub struct OperationRequest {
     pub install_directory: String,
     #[serde(default)]
     pub steam_username: String,
+    #[serde(default = "default_steam_language")]
+    pub steam_language: String,
     #[serde(default)]
     pub auth_method: AuthMethod,
 }
@@ -226,7 +337,11 @@ pub fn current_platform() -> PlatformSupport {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstallationSnapshot, InstallerState, ReleaseInfo};
+    use std::collections::BTreeSet;
+
+    use super::{
+        InstallationSnapshot, InstallerState, LANGUAGES, ReleaseInfo, depots_for, resolve_language,
+    };
 
     fn installed_snapshot(digest: Option<&str>) -> InstallationSnapshot {
         InstallationSnapshot {
@@ -276,10 +391,31 @@ mod tests {
         .expect("legacy state should remain compatible");
 
         assert_eq!(state.release_tag, "v1.2.3");
+        assert_eq!(state.steam_language, "english");
         assert_eq!(state.release_asset_digest.as_deref(), Some("sha256:aabb"));
         assert_eq!(
             state.manifests.get(&1_085_661),
             Some(&7_180_122_903_232_116_872)
+        );
+    }
+
+    #[test]
+    fn language_specs_have_unique_steam_names_and_depots() {
+        let names = LANGUAGES
+            .iter()
+            .map(|language| language.steam_language)
+            .collect::<BTreeSet<_>>();
+        let depots = LANGUAGES
+            .iter()
+            .map(|language| language.depot.depot_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), LANGUAGES.len());
+        assert_eq!(depots.len(), LANGUAGES.len());
+        assert_eq!(resolve_language("FRENCH").display_name, "French");
+        assert_eq!(resolve_language("unknown").steam_language, "english");
+        assert_eq!(
+            depots_for(resolve_language("koreana"))[1].depot_id,
+            1_085_674
         );
     }
 }

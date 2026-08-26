@@ -177,17 +177,54 @@ pub fn new_state(
     release_asset: String,
     release_asset_digest: Option<String>,
     installed_dll_sha256: String,
+    steam_language: String,
+    manifests: BTreeMap<u32, u64>,
 ) -> InstallerState {
     InstallerState {
-        schema_version: 1,
+        schema_version: 2,
         app_id: crate::models::STEAM_APP_ID,
         release_tag,
         release_asset,
         release_asset_digest,
         installed_dll_sha256,
         installed_at_utc: chrono::Utc::now(),
-        manifests: BTreeMap::from(crate::models::DEPOTS),
+        steam_language,
+        manifests,
     }
+}
+
+pub async fn save_sunrise_language(install_root: &Path, steam_language: &str) -> AppResult<()> {
+    let path = install_root
+        .join("bin")
+        .join("x64")
+        .join("Sunrise")
+        .join("settings.json");
+    let mut root = if path.is_file() {
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|error| AppError::io("Could not read Sunrise settings.json", error))?;
+        serde_json::from_slice::<serde_json::Value>(&bytes)?
+    } else {
+        serde_json::json!({})
+    };
+    let root_object = root
+        .as_object_mut()
+        .ok_or_else(|| AppError::message("Sunrise settings.json is not a JSON object."))?;
+    let steam = root_object
+        .entry("steam")
+        .or_insert_with(|| serde_json::json!({}));
+    if !steam.is_object() {
+        *steam = serde_json::json!({});
+    }
+    steam
+        .as_object_mut()
+        .expect("Steam settings were converted to an object")
+        .insert(
+            "language".into(),
+            serde_json::Value::String(steam_language.into()),
+        );
+    let bytes = serde_json::to_vec_pretty(&root)?;
+    write_atomic(&path, &bytes).await
 }
 
 async fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
@@ -216,4 +253,33 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
         .await
         .map_err(|error| AppError::io("Could not finish writing local installer data", error))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::save_sunrise_language;
+
+    #[tokio::test]
+    async fn language_update_preserves_other_sunrise_settings() {
+        let temporary = tempfile::tempdir().expect("temporary installation");
+        let sunrise = temporary.path().join("bin").join("x64").join("Sunrise");
+        std::fs::create_dir_all(&sunrise).expect("Sunrise settings directory");
+        let settings = sunrise.join("settings.json");
+        std::fs::write(
+            &settings,
+            br#"{"video":{"fieldOfView":90},"steam":{"offline":true}}"#,
+        )
+        .expect("existing settings");
+
+        save_sunrise_language(temporary.path(), "french")
+            .await
+            .expect("language setting update");
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(settings).expect("updated settings file"))
+                .expect("valid JSON settings");
+        assert_eq!(saved["steam"]["language"], "french");
+        assert_eq!(saved["steam"]["offline"], true);
+        assert_eq!(saved["video"]["fieldOfView"], 90);
+    }
 }

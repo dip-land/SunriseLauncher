@@ -1,5 +1,6 @@
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::available_space;
@@ -13,8 +14,9 @@ use walkdir::WalkDir;
 use crate::error::{AppError, AppResult};
 use crate::github::GitHubClient;
 use crate::models::{
-    AuthMethod, DEPOTS, FRESH_INSTALL_BYTES, GAME_EXECUTABLE, OperationEvent, OperationKind,
-    OperationRequest, OperationResult, REPAIR_BYTES, ReleaseInfo, STEAM_APP_ID, UPDATE_BYTES,
+    AuthMethod, BASE_DEPOT, DepotSpec, FRESH_INSTALL_BYTES, GAME_EXECUTABLE, LanguageSpec,
+    OperationEvent, OperationKind, OperationRequest, OperationResult, REPAIR_BYTES, ReleaseInfo,
+    STEAM_APP_ID, UPDATE_BYTES, depots_for, resolve_language,
 };
 use crate::storage;
 
@@ -47,6 +49,30 @@ pub async fn run(
     );
     let root = prepare_install_root(&request.install_directory, required)?;
     ensure_game_closed()?;
+    let requested_language = *resolve_language(&request.steam_language);
+    let existing_state = storage::load_state(&root).await?;
+    let operation_language = if matches!(request.kind, OperationKind::Update) {
+        existing_state
+            .as_ref()
+            .map(|state| *resolve_language(&state.steam_language))
+            .unwrap_or(requested_language)
+    } else {
+        requested_language
+    };
+    let previous_language = existing_state.as_ref().and_then(|state| {
+        let previous = *resolve_language(&state.steam_language);
+        (!previous
+            .steam_language
+            .eq_ignore_ascii_case(operation_language.steam_language))
+        .then(|| {
+            let manifest_id = state
+                .manifests
+                .get(&previous.depot.depot_id)
+                .copied()
+                .unwrap_or(previous.depot.manifest_id);
+            (previous, manifest_id)
+        })
+    });
 
     if !matches!(request.kind, OperationKind::Install) {
         verify_game_files(&root)?;
@@ -62,13 +88,29 @@ pub async fn run(
             &root,
             request.steam_username.trim(),
             request.auth_method,
+            &operation_language,
             matches!(request.kind, OperationKind::Repair),
             &on_event,
             &cancel,
-            terminal_input,
+            terminal_input.clone(),
         )
         .await?;
         verify_game_files(&root)?;
+        if let Some((previous, previous_manifest_id)) = previous_language {
+            switch_language_files(
+                &downloader,
+                &root,
+                request.steam_username.trim(),
+                request.auth_method,
+                &previous,
+                previous_manifest_id,
+                &operation_language,
+                &on_event,
+                &cancel,
+                terminal_input.clone(),
+            )
+            .await?;
+        }
         if matches!(request.kind, OperationKind::Repair) {
             progress(
                 &on_event,
@@ -129,11 +171,24 @@ pub async fn run(
         matches!(request.kind, OperationKind::Install | OperationKind::Repair),
     )
     .await?;
+    if matches!(request.kind, OperationKind::Install | OperationKind::Repair) {
+        storage::save_sunrise_language(&root, operation_language.steam_language).await?;
+    }
+    let manifests = if matches!(request.kind, OperationKind::Update) {
+        existing_state
+            .as_ref()
+            .map(|state| state.manifests.clone())
+            .unwrap_or_else(|| language_manifests(&operation_language))
+    } else {
+        language_manifests(&operation_language)
+    };
     let state = storage::new_state(
         release.tag.clone(),
         release.asset_name.clone(),
         release.digest.clone(),
         payload_hash,
+        operation_language.steam_language.into(),
+        manifests,
     );
     storage::save_state(&root, &state).await?;
 
@@ -149,6 +204,13 @@ pub async fn run(
         release_tag: release.tag,
         message,
     })
+}
+
+fn language_manifests(language: &LanguageSpec) -> BTreeMap<u32, u64> {
+    depots_for(language)
+        .into_iter()
+        .map(|depot| (depot.depot_id, depot.manifest_id))
+        .collect()
 }
 
 fn progress(on_event: &Channel<OperationEvent>, stage: &str, message: &str, percent: u8) {
@@ -436,6 +498,7 @@ async fn download_depots(
     install_root: &Path,
     steam_username: &str,
     auth_method: AuthMethod,
+    language: &LanguageSpec,
     validate: bool,
     on_event: &Channel<OperationEvent>,
     cancel: &CancellationToken,
@@ -452,16 +515,21 @@ async fn download_depots(
     let _ = on_event.send(OperationEvent::Notice {
         message: auth_message.into(),
     });
-    for (index, (depot, manifest)) in DEPOTS.into_iter().enumerate() {
+    for (index, depot) in depots_for(language).into_iter().enumerate() {
         cancel_check(cancel)?;
         let (start_percent, end_percent) = if index == 0 { (12, 49) } else { (50, 85) };
-        progress(on_event, "depots", "Preparing game files…", start_percent);
+        let message = if index == 0 {
+            "Preparing shared game files…".into()
+        } else {
+            format!("Preparing {} language files…", language.display_name)
+        };
+        progress(on_event, "depots", &message, start_percent);
         run_depot(
             executable,
             install_root,
             steam_username,
-            depot,
-            manifest,
+            depot.depot_id,
+            depot.manifest_id,
             validate,
             auth_method,
             index == 0,
@@ -470,11 +538,216 @@ async fn download_depots(
             on_event,
             cancel,
             terminal_input.clone(),
+            false,
         )
         .await?;
     }
     progress(on_event, "depots", "Steam game files are ready.", 86);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn switch_language_files(
+    executable: &Path,
+    install_root: &Path,
+    steam_username: &str,
+    auth_method: AuthMethod,
+    previous_language: &LanguageSpec,
+    previous_manifest_id: u64,
+    selected_language: &LanguageSpec,
+    on_event: &Channel<OperationEvent>,
+    cancel: &CancellationToken,
+    terminal_input: Arc<AsyncMutex<Option<ChildStdin>>>,
+) -> AppResult<()> {
+    progress(
+        on_event,
+        "language",
+        &format!(
+            "Switching game language from {} to {}…",
+            previous_language.display_name, selected_language.display_name
+        ),
+        87,
+    );
+    let previous_depot = DepotSpec::new(previous_language.depot.depot_id, previous_manifest_id);
+    let previous_files = read_manifest_files(
+        executable,
+        steam_username,
+        previous_depot,
+        auth_method,
+        on_event,
+        cancel,
+        terminal_input.clone(),
+    )
+    .await?;
+    let shared_files = read_manifest_files(
+        executable,
+        steam_username,
+        BASE_DEPOT,
+        auth_method,
+        on_event,
+        cancel,
+        terminal_input.clone(),
+    )
+    .await?;
+    let selected_files = read_manifest_files(
+        executable,
+        steam_username,
+        selected_language.depot,
+        auth_method,
+        on_event,
+        cancel,
+        terminal_input,
+    )
+    .await?;
+    let keep_files = shared_files
+        .iter()
+        .chain(&selected_files)
+        .map(|path| normalize_manifest_path(path))
+        .collect::<HashSet<_>>();
+    let obsolete_files = previous_files
+        .into_iter()
+        .filter(|path| !keep_files.contains(&normalize_manifest_path(path)))
+        .collect::<Vec<_>>();
+    let removed = remove_depot_files(install_root, &obsolete_files)?;
+    let _ = on_event.send(OperationEvent::Notice {
+        message: format!(
+            "Selected {} and removed {removed} obsolete {} language file(s).",
+            selected_language.display_name, previous_language.display_name
+        ),
+    });
+    progress(
+        on_event,
+        "language",
+        &format!(
+            "{} language files are ready.",
+            selected_language.display_name
+        ),
+        88,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_manifest_files(
+    executable: &Path,
+    steam_username: &str,
+    depot: DepotSpec,
+    auth_method: AuthMethod,
+    on_event: &Channel<OperationEvent>,
+    cancel: &CancellationToken,
+    terminal_input: Arc<AsyncMutex<Option<ChildStdin>>>,
+) -> AppResult<Vec<String>> {
+    cancel_check(cancel)?;
+    let temporary = tempfile::Builder::new()
+        .prefix("sunrise-manifest-")
+        .tempdir()
+        .map_err(|error| AppError::io("Could not create a manifest folder", error))?;
+    run_depot(
+        executable,
+        temporary.path(),
+        steam_username,
+        depot.depot_id,
+        depot.manifest_id,
+        false,
+        auth_method,
+        false,
+        86,
+        86,
+        on_event,
+        cancel,
+        terminal_input,
+        true,
+    )
+    .await?;
+    let manifest_path = temporary.path().join(format!(
+        "manifest_{}_{}.txt",
+        depot.depot_id, depot.manifest_id
+    ));
+    let manifest = tokio::fs::read_to_string(&manifest_path)
+        .await
+        .map_err(|error| {
+            AppError::io("DepotDownloader did not produce its manifest file", error)
+        })?;
+    let files = manifest
+        .lines()
+        .filter_map(parse_manifest_file)
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Err(AppError::message(format!(
+            "Depot {} manifest contained no readable files.",
+            depot.depot_id
+        )));
+    }
+    Ok(files)
+}
+
+fn parse_manifest_file(line: &str) -> Option<String> {
+    let mut remainder = line.trim();
+    let size = take_manifest_field(&mut remainder)?;
+    let chunks = take_manifest_field(&mut remainder)?;
+    let hash = take_manifest_field(&mut remainder)?;
+    let flags = take_manifest_field(&mut remainder)?;
+    size.parse::<u64>().ok()?;
+    chunks.parse::<u32>().ok()?;
+    (hash.len() == 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(())?;
+    u32::from_str_radix(flags, 16).ok()?;
+    (!remainder.is_empty()).then(|| remainder.replace('\\', "/"))
+}
+
+fn take_manifest_field<'a>(remainder: &mut &'a str) -> Option<&'a str> {
+    let boundary = remainder.find(char::is_whitespace)?;
+    let field = &remainder[..boundary];
+    *remainder = remainder[boundary..].trim_start();
+    (!field.is_empty()).then_some(field)
+}
+
+fn normalize_manifest_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase()
+}
+
+fn remove_depot_files(install_root: &Path, relative_paths: &[String]) -> AppResult<usize> {
+    let root = install_root
+        .canonicalize()
+        .map_err(|error| AppError::io("Could not resolve the installation folder", error))?;
+    let mut removed = 0;
+    for relative_path in relative_paths {
+        let normalized = relative_path.replace('\\', "/");
+        let relative = Path::new(&normalized);
+        if normalized.is_empty()
+            || normalized.contains(':')
+            || relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(AppError::message(
+                "A language depot contained an unsafe file path.",
+            ));
+        }
+        let target = root.join(relative);
+        if !target.exists() {
+            continue;
+        }
+        let resolved = target
+            .canonicalize()
+            .map_err(|error| AppError::io("Could not inspect a language file", error))?;
+        if !resolved.starts_with(&root) {
+            return Err(AppError::message(
+                "A language depot contained an unsafe file path.",
+            ));
+        }
+        if resolved.is_file() {
+            std::fs::remove_file(&target)
+                .map_err(|error| AppError::io("Could not remove an old language file", error))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -492,6 +765,7 @@ async fn run_depot(
     on_event: &Channel<OperationEvent>,
     cancel: &CancellationToken,
     terminal_input: Arc<AsyncMutex<Option<ChildStdin>>>,
+    manifest_only: bool,
 ) -> AppResult<()> {
     let mut command = Command::new(executable);
     command
@@ -512,6 +786,9 @@ async fn run_depot(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if manifest_only {
+        command.arg("-manifest-only");
+    }
     if validate {
         command.arg("-validate");
     }
@@ -524,14 +801,11 @@ async fn run_depot(
         .spawn()
         .map_err(|error| AppError::io("DepotDownloader could not be started", error))?;
     *terminal_input.lock().await = child.stdin.take();
-    let stdout_task = child.stdout.take().map(|stdout| {
-        stream_output(
-            stdout,
-            "stdout",
-            on_event.clone(),
-            Some(DepotProgress::new(start_percent, end_percent)),
-        )
-    });
+    let depot_progress = (!manifest_only).then(|| DepotProgress::new(start_percent, end_percent));
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|stdout| stream_output(stdout, "stdout", on_event.clone(), depot_progress));
     let stderr_task = child
         .stderr
         .take()
@@ -1058,8 +1332,8 @@ async fn install_payload(
 mod tests {
     use super::{
         AuthCompletionScanner, AuthPromptScanner, DepotProgress, QrCapture, TerminalDecoder,
-        authentication_args, depot_asset_name, parse_depot_file, parse_validating_file,
-        sanitize_name,
+        authentication_args, depot_asset_name, parse_depot_file, parse_manifest_file,
+        parse_validating_file, remove_depot_files, sanitize_name,
     };
     use crate::models::AuthMethod;
 
@@ -1174,6 +1448,37 @@ mod tests {
             ),
             Some("activity.pkg")
         );
+    }
+
+    #[test]
+    fn manifest_parser_preserves_file_paths_with_spaces() {
+        assert_eq!(
+            parse_manifest_file(
+                "123 4 0123456789abcdef0123456789abcdef01234567 0 packages/audio file.pkg"
+            ),
+            Some("packages/audio file.pkg".into())
+        );
+        assert_eq!(parse_manifest_file("not a manifest line"), None);
+    }
+
+    #[test]
+    fn language_cleanup_only_removes_safe_manifest_files() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let packages = temporary.path().join("packages");
+        std::fs::create_dir_all(&packages).expect("packages directory");
+        let obsolete = packages.join("old.pkg");
+        let retained = packages.join("shared.pkg");
+        std::fs::write(&obsolete, b"old").expect("obsolete language file");
+        std::fs::write(&retained, b"shared").expect("shared language file");
+        let removed = remove_depot_files(
+            temporary.path(),
+            &["packages/old.pkg".into(), "packages/missing.pkg".into()],
+        )
+        .expect("safe cleanup");
+        assert_eq!(removed, 1);
+        assert!(!obsolete.exists());
+        assert!(retained.exists());
+        assert!(remove_depot_files(temporary.path(), &["../outside.pkg".into()]).is_err());
     }
 
     #[test]

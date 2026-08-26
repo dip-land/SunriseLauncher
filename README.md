@@ -19,15 +19,34 @@ This repository is an early functional rewrite of [SunriseInstaller](https://git
 1. Validate the target folder, write access, and free space.
 2. Download the matching native DepotDownloader release for the host OS/architecture.
 3. Stream DepotDownloader output into the in-app console for QR/Steam Guard authentication.
-4. Download the two pinned, owned Steam depot manifests.
+4. Download the pinned shared depot and the selected language depot.
 5. Download `steam_api64.dll` from the latest Sunrise GitHub release.
 6. Verify GitHub's SHA-256 digest, preserve rollback/original copies, and install the DLL.
 7. Save a compatible `.sunrise/install-state.json` for update and integrity checks.
 
-The pinned manifests are the same ones used by the current installer:
+The shared Windows depot is `1085661`, manifest `7180122903232116872`.
+One language depot is selected during Install or Repair:
 
-- Depot `1085661`, manifest `7180122903232116872`
-- Depot `1085662`, manifest `2210332166360342287`
+| Language | Steam language | Depot | Manifest |
+| --- | --- | ---: | ---: |
+| English | `english` | `1085662` | `2210332166360342287` |
+| French | `french` | `1085663` | `2934940253687559290` |
+| German | `german` | `1085664` | `2207989571290186153` |
+| Italian | `italian` | `1085665` | `6668232053215128229` |
+| Japanese | `japanese` | `1085666` | `7430022397683116838` |
+| Portuguese (Brazil) | `brazilian` | `1085667` | `9037238175838085860` |
+| Spanish (Spain) | `spanish` | `1085668` | `3424833900894552134` |
+| Russian | `russian` | `1085669` | `4539277942371480381` |
+| Polish | `polish` | `1085670` | `6407581507105256731` |
+| Chinese (Simplified) | `schinese` | `1085671` | `4397663774546719308` |
+| Chinese (Traditional) | `tchinese` | `1085672` | `3906738704604711877` |
+| Spanish (Latin America) | `latam` | `1085673` | `4773170998099699561` |
+| Korean | `koreana` | `1085674` | `7148196199569436690` |
+
+When a managed installation changes language, the launcher downloads the new
+depot first, compares the old/shared/new manifests, and removes only files that
+are unique to the previous language. It also updates
+`bin/x64/Sunrise/settings.json` with the selected Steam language.
 
 ## Development
 

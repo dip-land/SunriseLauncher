@@ -4,7 +4,12 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 type AuthMethod = "qr" | "twoFactor";
-type Preferences = { installDirectory: string; steamUsername: string; authMethod: AuthMethod };
+type Preferences = {
+  installDirectory: string;
+  steamUsername: string;
+  steamLanguage: string;
+  authMethod: AuthMethod;
+};
 type PlatformSupport = {
   os: string;
   arch: string;
@@ -46,6 +51,24 @@ type OperationEvent =
   | { event: "notice"; message: string };
 type EventSink = { onmessage?: (message: OperationEvent) => void };
 
+const LANGUAGE_LABELS: Record<string, string> = {
+  english: "English",
+  french: "French",
+  german: "German",
+  italian: "Italian",
+  japanese: "Japanese",
+  brazilian: "Portuguese (Brazil)",
+  spanish: "Spanish (Spain)",
+  russian: "Russian",
+  polish: "Polish",
+  schinese: "Chinese (Simplified)",
+  tchinese: "Chinese (Traditional)",
+  latam: "Spanish (Latin America)",
+  koreana: "Korean",
+};
+
+const languageLabel = (steamLanguage: string) => LANGUAGE_LABELS[steamLanguage] ?? "English";
+
 const element = <T extends HTMLElement>(selector: string): T => {
   const found = document.querySelector<T>(selector);
   if (!found) throw new Error(`Missing interface element: ${selector}`);
@@ -54,6 +77,7 @@ const element = <T extends HTMLElement>(selector: string): T => {
 
 const installDirectory = element<HTMLInputElement>("#install-directory");
 const steamUsername = element<HTMLInputElement>("#steam-username");
+const gameLanguage = element<HTMLSelectElement>("#game-language");
 const primaryAction = element<HTMLButtonElement>("#primary-action");
 const primaryLabel = element<HTMLElement>("#primary-label");
 const repairAction = element<HTMLButtonElement>("#repair-action");
@@ -66,6 +90,7 @@ const authView = element<HTMLElement>("#auth-view");
 const operationStrip = element<HTMLElement>("#operation-strip");
 const setupInstallDirectory = element<HTMLInputElement>("#setup-install-directory");
 const setupSteamUsername = element<HTMLInputElement>("#setup-steam-username");
+const setupGameLanguage = element<HTMLSelectElement>("#setup-game-language");
 const setupPathStatus = element<HTMLElement>("#setup-path-status");
 const setupBack = element<HTMLButtonElement>("#setup-back");
 const setupNext = element<HTMLButtonElement>("#setup-next");
@@ -88,7 +113,12 @@ let operationRunning = false;
 let gameLaunching = false;
 let operationCancellationRequested = false;
 let setupStep = 0;
-let setupDraft: Preferences = { installDirectory: "", steamUsername: "", authMethod: "qr" };
+let setupDraft: Preferences = {
+  installDirectory: "",
+  steamUsername: "",
+  steamLanguage: "english",
+  authMethod: "qr",
+};
 let setupInspection: InstallationSnapshot | null = null;
 let activeAuthMethod: AuthMethod = "qr";
 let activeAuthPrompt: "password" | "twoFactor" | "emailCode" | null = null;
@@ -127,7 +157,12 @@ const mockSnapshot: AppSnapshot = {
     canLaunch: true,
     summary: "Native install, repair, update, and launch support.",
   },
-  preferences: { installDirectory: "C:\\Games\\Project Sunrise", steamUsername: "", authMethod: "qr" },
+  preferences: {
+    installDirectory: "C:\\Games\\Project Sunrise",
+    steamUsername: "",
+    steamLanguage: "english",
+    authMethod: "qr",
+  },
   installation: {
     status: "notInstalled",
     message: "This folder is ready for a new Sunrise installation.",
@@ -186,6 +221,7 @@ async function invokeCommand<T>(command: string, args: Record<string, unknown> =
       kind?: OperationKind;
       installDirectory?: string;
       steamUsername?: string;
+      steamLanguage?: string;
       authMethod?: AuthMethod;
     };
     const authenticationEvents: OperationEvent[] = request.authMethod === "twoFactor"
@@ -219,6 +255,7 @@ async function invokeCommand<T>(command: string, args: Record<string, unknown> =
     }
     mockSnapshot.preferences.installDirectory = request.installDirectory ?? mockSnapshot.preferences.installDirectory;
     mockSnapshot.preferences.steamUsername = request.steamUsername ?? mockSnapshot.preferences.steamUsername;
+    mockSnapshot.preferences.steamLanguage = request.steamLanguage ?? mockSnapshot.preferences.steamLanguage;
     mockSnapshot.installation = {
       status: "installed",
       message: "Sunrise is installed and ready to play.",
@@ -270,8 +307,15 @@ function statusCopy(installation: InstallationSnapshot) {
   }
 }
 
+function updateLanguageWarnings() {
+  element<HTMLElement>("#settings-language-warning").hidden = gameLanguage.value === "english";
+  element<HTMLElement>("#setup-language-warning").hidden = setupGameLanguage.value === "english";
+}
+
 function renderSnapshot(data: AppSnapshot) {
   snapshot = data;
+  gameLanguage.value = data.preferences.steamLanguage || "english";
+  updateLanguageWarnings();
   const copy = statusCopy(data.installation);
   element("#install-status").textContent = copy.title;
   element("#install-message").textContent = data.installation.message;
@@ -326,6 +370,7 @@ async function loadSnapshot(useInputs = false) {
     } else if (installDirectory.value !== data.preferences.installDirectory) {
       data.preferences.installDirectory = installDirectory.value;
       data.preferences.steamUsername = steamUsername.value;
+      data.preferences.steamLanguage = gameLanguage.value;
       data.installation = await invokeCommand<InstallationSnapshot>("inspect_installation", {
         installDirectory: installDirectory.value,
       });
@@ -342,6 +387,7 @@ async function saveAndInspect() {
   const preferences: Preferences = {
     installDirectory: installDirectory.value.trim(),
     steamUsername: steamUsername.value.trim(),
+    steamLanguage: gameLanguage.value,
     authMethod: snapshot?.preferences.authMethod ?? "qr",
   };
   try {
@@ -445,6 +491,8 @@ function renderSetupStep() {
   }
   if (setupStep === 1) {
     setupSteamUsername.value = setupDraft.steamUsername;
+    setupGameLanguage.value = setupDraft.steamLanguage;
+    updateLanguageWarnings();
     document.querySelectorAll<HTMLInputElement>('input[name="setup-auth-method"]').forEach((input) => {
       input.checked = input.value === setupDraft.authMethod;
     });
@@ -452,6 +500,7 @@ function renderSetupStep() {
   if (setupStep === 2) {
     setupView.dataset.installDirectory = setupDraft.installDirectory;
     setupView.dataset.steamUsername = setupDraft.steamUsername;
+    setupView.dataset.steamLanguage = setupDraft.steamLanguage;
     setupView.dataset.authMethod = setupDraft.authMethod;
     element("#setup-review-title").textContent = existingGame ? "Existing installation found" : "Ready to install";
     element("#setup-review-description").textContent = existingGame
@@ -461,6 +510,7 @@ function renderSetupStep() {
     element("#setup-review-game-files").textContent = existingGame
       ? "Verify existing Destiny 2 files"
       : "Download Destiny 2";
+    element("#setup-review-language").textContent = languageLabel(setupDraft.steamLanguage);
     element("#setup-review-username").textContent = setupDraft.steamUsername || "—";
     element("#setup-review-auth").textContent = setupDraft.authMethod === "qr" ? "QR code" : "Steam Guard code";
     element("#setup-review-space").textContent = existingGame
@@ -475,6 +525,7 @@ function openSetup() {
   setupDraft = {
     installDirectory: installDirectory.value.trim(),
     steamUsername: steamUsername.value.trim(),
+    steamLanguage: snapshot?.preferences.steamLanguage ?? "english",
     authMethod: snapshot?.preferences.authMethod ?? "qr",
   };
   setupInspection = snapshot?.installation ?? null;
@@ -517,6 +568,7 @@ async function advanceSetup() {
       return;
     }
     setupDraft.steamUsername = setupSteamUsername.value.trim();
+    setupDraft.steamLanguage = setupGameLanguage.value;
     setupDraft.authMethod = element<HTMLInputElement>('input[name="setup-auth-method"]:checked').value as AuthMethod;
     setupStep = 2;
     renderSetupStep();
@@ -527,10 +579,12 @@ async function advanceSetup() {
   const setupPreferences: Preferences = {
     installDirectory: setupView.dataset.installDirectory ?? setupDraft.installDirectory,
     steamUsername: setupView.dataset.steamUsername ?? setupDraft.steamUsername,
+    steamLanguage: setupView.dataset.steamLanguage ?? setupDraft.steamLanguage,
     authMethod: (setupView.dataset.authMethod as AuthMethod | undefined) ?? setupDraft.authMethod,
   };
   installDirectory.value = setupPreferences.installDirectory;
   steamUsername.value = setupPreferences.steamUsername;
+  gameLanguage.value = setupPreferences.steamLanguage;
   closeSetup();
   await runOperation("install", setupPreferences);
 }
@@ -710,6 +764,8 @@ function updateOperationStep(stage: string, message: string) {
     label = "DOWNLOADING DEPOTDOWNLOADER";
   } else if (stage === "repair") {
     label = "REPAIRING SUNRISE";
+  } else if (stage === "language") {
+    label = "UPDATING GAME LANGUAGE";
   }
 
   element("#operation-kind").textContent = label;
@@ -792,6 +848,7 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
   const operationPreferences: Preferences = requestedPreferences ?? {
     installDirectory: installDirectory.value.trim(),
     steamUsername: steamUsername.value.trim(),
+    steamLanguage: gameLanguage.value,
     authMethod: snapshot?.preferences.authMethod ?? "qr",
   };
   activeAuthMethod = operationPreferences.authMethod;
@@ -806,6 +863,7 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
   launchAction.disabled = true;
   installDirectory.disabled = true;
   steamUsername.disabled = true;
+  gameLanguage.disabled = true;
   element<HTMLButtonElement>("#browse-directory").disabled = true;
 
   const onEvent: EventSink = inTauri ? new Channel<OperationEvent>() : {};
@@ -816,6 +874,7 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
         kind,
         installDirectory: operationPreferences.installDirectory,
         steamUsername: operationPreferences.steamUsername,
+        steamLanguage: operationPreferences.steamLanguage,
         authMethod: operationPreferences.authMethod,
       },
       onEvent,
@@ -847,8 +906,10 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
     element<HTMLButtonElement>("#cancel-action").disabled = true;
     installDirectory.disabled = false;
     steamUsername.disabled = false;
+    gameLanguage.disabled = false;
     installDirectory.value = operationPreferences.installDirectory;
     steamUsername.value = operationPreferences.steamUsername;
+    gameLanguage.value = operationPreferences.steamLanguage;
     element<HTMLButtonElement>("#browse-directory").disabled = false;
     await loadSnapshot(true);
     if (operationCompleted && snapshot?.platform.canLaunch) {
@@ -948,6 +1009,10 @@ window.addEventListener("DOMContentLoaded", () => {
       if (input.checked) setupDraft.authMethod = input.value as AuthMethod;
     });
   });
+  setupGameLanguage.addEventListener("change", () => {
+    setupDraft.steamLanguage = setupGameLanguage.value;
+    updateLanguageWarnings();
+  });
   setupBack.addEventListener("click", () => {
     setupStep = Math.max(0, setupStep - 1);
     renderSetupStep();
@@ -958,6 +1023,10 @@ window.addEventListener("DOMContentLoaded", () => {
     statusTimer = window.setTimeout(saveAndInspect, 450);
   });
   steamUsername.addEventListener("change", saveAndInspect);
+  gameLanguage.addEventListener("change", () => {
+    updateLanguageWarnings();
+    void saveAndInspect();
+  });
   element("#refresh-status").addEventListener("click", () => loadSnapshot(true));
   primaryAction.addEventListener("click", () => {
     if (primaryMode === "install") {
