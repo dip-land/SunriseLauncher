@@ -885,7 +885,17 @@ impl AuthPromptScanner {
     }
 }
 
-const AUTH_COMPLETE_MARKERS: [&str; 2] = ["using steam3 suggested cellid", "got session token"];
+const AUTH_COMPLETE_MARKERS: [&str; 9] = [
+    "using steam3 suggested cellid",
+    "got session token",
+    "licenses for account",
+    "got appinfo for",
+    "using app branch:",
+    "got depot key for",
+    "processing depot ",
+    "downloading depot ",
+    "got manifest request code",
+];
 
 #[derive(Default)]
 struct AuthCompletionScanner {
@@ -1138,6 +1148,16 @@ mod tests {
         assert!(!scanner.push("Logging 'sunrise' into Steam3... Done! Using Steam3 sug"));
         assert!(scanner.push("gested CellID: 207"));
         assert!(!scanner.push("Got session token!"));
+    }
+
+    #[test]
+    fn auth_completion_scanner_detects_post_steam_guard_output() {
+        let mut scanner = AuthCompletionScanner::default();
+        assert!(!scanner.push(
+            "STEAM GUARD! Please enter your 2-factor auth code from your authenticator app: "
+        ));
+        assert!(!scanner.push("Done!\r\n"));
+        assert!(scanner.push("Got 2329 licenses for account!\r\n"));
     }
 
     #[test]

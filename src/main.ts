@@ -72,6 +72,9 @@ const setupNext = element<HTMLButtonElement>("#setup-next");
 const authResponseForm = element<HTMLFormElement>("#auth-response-form");
 const authResponse = element<HTMLInputElement>("#auth-response");
 const authPrivacy = element<HTMLElement>("#auth-privacy");
+const authLoadingPanel = element<HTMLElement>("#auth-loading-panel");
+const authLoadingTitle = element<HTMLElement>("#auth-loading-title");
+const authLoadingDetail = element<HTMLElement>("#auth-loading-detail");
 const authQrCode = (() => {
   const found = document.querySelector<SVGSVGElement>("#auth-qr-code");
   if (!found) throw new Error("Missing interface element: #auth-qr-code");
@@ -89,6 +92,7 @@ let setupDraft: Preferences = { installDirectory: "", steamUsername: "", authMet
 let setupInspection: InstallationSnapshot | null = null;
 let activeAuthMethod: AuthMethod = "qr";
 let activeAuthPrompt: "password" | "twoFactor" | "emailCode" | null = null;
+let authSessionReady = false;
 let passwordPromptSeen = false;
 let pendingAuthRestart: AuthMethod | null = null;
 let statusTimer: number | undefined;
@@ -96,6 +100,7 @@ let setupInspectionTimer: number | undefined;
 let toastTimer: number | undefined;
 let operationHideTimer: number | undefined;
 let launchGuardTimer: number | undefined;
+let authHideTimer: number | undefined;
 let mockOperationCancelled = false;
 const LAUNCH_GUARD_MS = 4000;
 const inTauri = "__TAURI_INTERNALS__" in window;
@@ -531,6 +536,10 @@ async function advanceSetup() {
 }
 
 function hideAuth() {
+  window.clearTimeout(authHideTimer);
+  authSessionReady = false;
+  activeAuthPrompt = null;
+  authLoadingPanel.classList.remove("complete");
   setOverlay(authView, false);
 }
 
@@ -540,25 +549,37 @@ function updateAuthMethodSwitch() {
   });
 }
 
+function showAuthLoading(title: string, detail: string, status: string) {
+  window.clearTimeout(authHideTimer);
+  authLoadingPanel.hidden = false;
+  authLoadingPanel.classList.remove("complete");
+  authLoadingTitle.textContent = title;
+  authLoadingDetail.textContent = detail;
+  element("#auth-status").textContent = status;
+  element<HTMLElement>("#qr-auth-panel").hidden = true;
+  authResponseForm.hidden = true;
+  authPrivacy.hidden = true;
+}
+
 function prepareAuth(method: AuthMethod) {
   activeAuthMethod = method;
   activeAuthPrompt = null;
+  authSessionReady = false;
   passwordPromptSeen = false;
   updateAuthMethodSwitch();
-  element("#auth-title").textContent = method === "qr" ? "Scan with Steam" : "Steam Guard sign-in";
+  element("#auth-title").textContent = "Connecting to Steam";
   element("#auth-description").textContent = method === "qr"
-    ? "A secure QR code will appear when DepotDownloader connects."
+    ? "DepotDownloader will reuse a saved Steam session or show a QR code when sign-in is needed."
     : "DepotDownloader will reuse a saved Steam session or request your password and Steam Guard code.";
-  element("#auth-status").textContent = method === "qr"
-    ? "Waiting for DepotDownloader…"
-    : "Checking for a saved Steam session…";
-  element<HTMLElement>("#qr-auth-panel").hidden = method !== "qr";
-  authResponseForm.hidden = true;
-  authPrivacy.hidden = method === "qr";
   authResponse.disabled = true;
   authResponse.value = "";
   authQrCode.setAttribute("hidden", "");
   element("#qr-placeholder").hidden = false;
+  showAuthLoading(
+    "Preparing DepotDownloader",
+    "Checking the local tool before opening a secure Steam connection.",
+    "Starting Steam authentication…",
+  );
   setOverlay(settingsView, false);
   setOverlay(setupView, false);
   setOverlay(authView, true);
@@ -595,8 +616,12 @@ function renderQrCode(rows: string[]) {
 }
 
 function showQrCode(rows: string[]) {
+  window.clearTimeout(authHideTimer);
   activeAuthMethod = "qr";
   activeAuthPrompt = null;
+  authSessionReady = false;
+  authLoadingPanel.hidden = true;
+  authLoadingPanel.classList.remove("complete");
   updateAuthMethodSwitch();
   element("#auth-title").textContent = "Scan with Steam";
   element("#auth-description").textContent = "Approve this sign-in from the Steam Mobile app.";
@@ -609,10 +634,14 @@ function showQrCode(rows: string[]) {
 }
 
 function showAuthPrompt(kind: "password" | "twoFactor" | "emailCode", message: string) {
+  window.clearTimeout(authHideTimer);
+  authSessionReady = false;
   const password = kind === "password";
   const reusedSession = !password && !passwordPromptSeen;
   if (password) passwordPromptSeen = true;
   activeAuthPrompt = kind;
+  authLoadingPanel.hidden = true;
+  authLoadingPanel.classList.remove("complete");
   element("#auth-title").textContent = password ? "Enter Steam password" : "Enter Steam Guard code";
   element("#auth-description").textContent = reusedSession
     ? "DepotDownloader reused your saved Steam session, so only a Steam Guard code is required."
@@ -642,7 +671,11 @@ async function restartAuthentication(method: AuthMethod) {
   if (!operationRunning || method === activeAuthMethod) return;
   pendingAuthRestart = method;
   prepareAuth(method);
-  element("#auth-status").textContent = "Restarting DepotDownloader with this sign-in method…";
+  showAuthLoading(
+    "Restarting DepotDownloader",
+    "Stopping the current sign-in attempt and switching authentication methods.",
+    "Restarting with this sign-in method…",
+  );
   element("#operation-message").textContent = "Restarting Steam authentication…";
   const cancelled = await invokeCommand<boolean>("cancel_operation");
   if (!cancelled) {
@@ -691,6 +724,22 @@ function appendConsole(text: string, stream = "stdout") {
   consoleOutput.scrollTop = consoleOutput.scrollHeight;
 }
 
+function updateAuthLoadingStage(stage: string, message: string) {
+  if (authSessionReady || authView.hidden || authLoadingPanel.hidden || activeAuthPrompt) return;
+
+  if (stage === "preflight") {
+    showAuthLoading("Preparing installation", message, "Getting Steam sign-in ready…");
+  } else if (stage === "tool") {
+    showAuthLoading("Preparing DepotDownloader", message, "Starting DepotDownloader…");
+  } else if (stage === "depots") {
+    showAuthLoading(
+      "Checking saved Steam session",
+      "DepotDownloader is connecting to Steam. You will only be asked to sign in if needed.",
+      "Checking cached authentication…",
+    );
+  }
+}
+
 function handleOperationEvent(message: OperationEvent) {
   if (message.event === "qrCode") {
     showQrCode(message.rows);
@@ -701,8 +750,17 @@ function handleOperationEvent(message: OperationEvent) {
     return;
   }
   if (message.event === "authComplete") {
+    authSessionReady = true;
     activeAuthPrompt = null;
-    hideAuth();
+    showAuthLoading(
+      "Steam session ready",
+      "Authentication is complete. Continuing the depot download.",
+      "Steam authenticated · continuing…",
+    );
+    authLoadingPanel.classList.add("complete");
+    authHideTimer = window.setTimeout(() => {
+      if (!authView.hidden && authSessionReady) hideAuth();
+    }, 650);
     element("#operation-notice").textContent = "Steam authenticated · continuing the depot download.";
     return;
   }
@@ -717,6 +775,7 @@ function handleOperationEvent(message: OperationEvent) {
   }
   const percent = Math.max(0, Math.min(100, message.percent));
   const percentLabel = Number.isInteger(percent) ? String(percent) : percent.toFixed(2);
+  updateAuthLoadingStage(message.stage, message.message);
   updateOperationStep(message.stage, message.message);
   element("#operation-message").textContent = message.message;
   element("#operation-percent").textContent = `${percentLabel}%`;
@@ -948,6 +1007,7 @@ window.addEventListener("DOMContentLoaded", () => {
   authResponseForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!authResponse.value) return;
+    const submittedPrompt = activeAuthPrompt;
     const response = authResponse.value;
     authResponse.value = "";
     authResponse.disabled = true;
@@ -960,9 +1020,11 @@ window.addEventListener("DOMContentLoaded", () => {
         showToast("DepotDownloader is not waiting for a response.", "error");
         return;
       }
-      element("#auth-status").textContent = activeAuthPrompt === "password"
-        ? "Password sent · waiting for Steam Guard…"
-        : "Code sent · waiting for Steam…";
+      if (!authSessionReady) {
+        element("#auth-status").textContent = submittedPrompt === "password"
+          ? "Password sent · waiting for Steam Guard…"
+          : "Code sent · waiting for Steam…";
+      }
     } catch (error) {
       authResponse.disabled = false;
       authResponseForm.querySelector<HTMLButtonElement>("button")!.disabled = false;

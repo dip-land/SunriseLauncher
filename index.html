@@ -220,7 +220,13 @@
             <button type="button" data-auth-switch="twoFactor">Steam Guard code</button>
           </div>
 
-          <section class="qr-auth-panel" id="qr-auth-panel">
+          <section class="auth-loading-panel" id="auth-loading-panel" role="status" aria-live="polite">
+            <span class="auth-loading-spinner" aria-hidden="true"></span>
+            <strong id="auth-loading-title">Preparing DepotDownloader</strong>
+            <small id="auth-loading-detail">Opening a secure connection to Steam.</small>
+          </section>
+
+          <section class="qr-auth-panel" id="qr-auth-panel" hidden>
             <div class="qr-surface">
               <svg id="auth-qr-code" role="img" aria-label="Steam sign-in QR code" hidden></svg>
               <div class="qr-placeholder" id="qr-placeholder"><span></span><strong>Waiting for QR code</strong><small>This may take a moment.</small></div>
