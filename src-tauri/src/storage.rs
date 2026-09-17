@@ -1,13 +1,16 @@
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use pelite::pe64::{Pe, PeFile};
+use pelite::resources::Name;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    GAME_EXECUTABLE, InstallationSnapshot, InstallerState, MOD_RELATIVE_PATH, Preferences,
+    GAME_EXECUTABLE, InstallationSnapshot, InstallerState, LanguageSpec, MOD_RELATIVE_PATH,
+    Preferences, resolve_language,
 };
 
 pub fn app_data_dir(app: &AppHandle) -> AppResult<PathBuf> {
@@ -84,7 +87,11 @@ pub async fn inspect_installation(path: &str) -> AppResult<InstallationSnapshot>
     }
     let root = PathBuf::from(path.trim());
     let game_found = root.join(GAME_EXECUTABLE).is_file();
-    let Some(state) = load_state(&root).await? else {
+    let state = load_state(&root).await?;
+    let steam_language = installed_language(&root, state.as_ref())
+        .await
+        .map(|language| language.steam_language.to_owned());
+    let Some(state) = state else {
         return Ok(InstallationSnapshot {
             status: if game_found {
                 "unmanaged"
@@ -103,6 +110,8 @@ pub async fn inspect_installation(path: &str) -> AppResult<InstallationSnapshot>
             installed_release_digest: None,
             installed_at: None,
             local_file_changed: false,
+            steam_language,
+            missions_commit: None,
         });
     };
 
@@ -116,6 +125,8 @@ pub async fn inspect_installation(path: &str) -> AppResult<InstallationSnapshot>
             installed_release_digest: state.release_asset_digest,
             installed_at: Some(state.installed_at_utc),
             local_file_changed: true,
+            steam_language,
+            missions_commit: state.missions_commit,
         });
     }
 
@@ -135,6 +146,8 @@ pub async fn inspect_installation(path: &str) -> AppResult<InstallationSnapshot>
         installed_release_digest: state.release_asset_digest,
         installed_at: Some(state.installed_at_utc),
         local_file_changed: changed,
+        steam_language,
+        missions_commit: state.missions_commit,
     })
 }
 
@@ -172,59 +185,139 @@ pub fn mod_path(install_root: &Path) -> PathBuf {
         .fold(install_root.to_path_buf(), |path, part| path.join(part))
 }
 
-pub fn new_state(
-    release_tag: String,
-    release_asset: String,
-    release_asset_digest: Option<String>,
-    installed_dll_sha256: String,
-    steam_language: String,
-    manifests: BTreeMap<u32, u64>,
-) -> InstallerState {
-    InstallerState {
-        schema_version: 2,
-        app_id: crate::models::STEAM_APP_ID,
-        release_tag,
-        release_asset,
-        release_asset_digest,
-        installed_dll_sha256,
-        installed_at_utc: chrono::Utc::now(),
-        steam_language,
-        manifests,
-    }
-}
-
-pub async fn save_sunrise_language(install_root: &Path, steam_language: &str) -> AppResult<()> {
-    let path = install_root
+pub fn settings_path(install_root: &Path) -> PathBuf {
+    install_root
         .join("bin")
         .join("x64")
         .join("Sunrise")
-        .join("settings.json");
-    let mut root = if path.is_file() {
+        .join("settings.json")
+}
+
+/** The recorded install language, then the settings.json language, else none. */
+pub async fn installed_language(
+    install_root: &Path,
+    state: Option<&InstallerState>,
+) -> Option<&'static LanguageSpec> {
+    if let Some(language) = state.and_then(|state| state.steam_language.as_deref()) {
+        return Some(resolve_language(language));
+    }
+    let bytes = tokio::fs::read(settings_path(install_root)).await.ok()?;
+    let settings = serde_json::from_slice::<Value>(without_byte_order_mark(&bytes)).ok()?;
+    settings["steam"]["language"].as_str().map(resolve_language)
+}
+
+/**
+ * Builds settings.json from the defaults inside `dll`, with the Steam language set.
+ * The DLL replaces a file older than its settings version, which drops the language.
+ */
+pub async fn prepare_sunrise_settings(
+    install_root: &Path,
+    dll: &Path,
+    steam_language: &str,
+    reset: bool,
+) -> AppResult<Vec<u8>> {
+    let dll_bytes = tokio::fs::read(dll)
+        .await
+        .map_err(|error| AppError::io("Could not read the Sunrise DLL", error))?;
+    let defaults = bundled_settings(&dll_bytes)?;
+    let path = settings_path(install_root);
+    let existing = if !reset && path.is_file() {
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|error| AppError::io("Could not read Sunrise settings.json", error))?;
-        serde_json::from_slice::<serde_json::Value>(&bytes)?
+        let Ok(Value::Object(existing)) =
+            serde_json::from_slice::<Value>(without_byte_order_mark(&bytes))
+        else {
+            return Err(AppError::message(
+                "Sunrise settings.json could not be read.",
+            ));
+        };
+        Some(existing)
     } else {
-        serde_json::json!({})
+        None
     };
-    let root_object = root
-        .as_object_mut()
-        .ok_or_else(|| AppError::message("Sunrise settings.json is not a JSON object."))?;
-    let steam = root_object
-        .entry("steam")
-        .or_insert_with(|| serde_json::json!({}));
-    if !steam.is_object() {
-        *steam = serde_json::json!({});
+    let settings = merge_settings(defaults, existing, steam_language)?;
+    Ok(serde_json::to_vec_pretty(&settings)?)
+}
+
+pub async fn write_sunrise_settings(install_root: &Path, settings: &[u8]) -> AppResult<()> {
+    write_atomic(&settings_path(install_root), settings).await
+}
+
+fn merge_settings(
+    defaults: Map<String, Value>,
+    existing: Option<Map<String, Value>>,
+    steam_language: &str,
+) -> AppResult<Map<String, Value>> {
+    let mut settings = match existing {
+        Some(mut existing) if settings_version(&existing) >= settings_version(&defaults) => {
+            add_missing_defaults(&mut existing, &defaults);
+            existing
+        }
+        _ => defaults,
+    };
+    let Some(Value::Object(steam)) = settings.get_mut("steam") else {
+        return Err(AppError::message(
+            "Sunrise settings.json has no valid Steam section.",
+        ));
+    };
+    steam.insert("language".into(), Value::String(steam_language.into()));
+    Ok(settings)
+}
+
+// The Sunrise DLL embeds its default settings as RCDATA resource 101.
+const DEFAULT_SETTINGS_RESOURCE: u32 = 101;
+const RT_RCDATA: u32 = 10;
+
+fn bundled_settings(dll: &[u8]) -> AppResult<Map<String, Value>> {
+    let invalid = || AppError::message("The Sunrise DLL does not contain valid default settings.");
+    let pe = PeFile::from_bytes(dll).map_err(|_| invalid())?;
+    let document = pe
+        .resources()
+        .ok()
+        .and_then(|resources| {
+            resources
+                .find_resource(&[Name::Id(RT_RCDATA), Name::Id(DEFAULT_SETTINGS_RESOURCE)])
+                .ok()
+        })
+        .ok_or_else(invalid)?;
+    let Ok(Value::Object(settings)) =
+        serde_json::from_slice::<Value>(without_byte_order_mark(document))
+    else {
+        return Err(invalid());
+    };
+    if settings_version(&settings) == 0 || !settings.get("steam").is_some_and(Value::is_object) {
+        return Err(invalid());
     }
-    steam
-        .as_object_mut()
-        .expect("Steam settings were converted to an object")
-        .insert(
-            "language".into(),
-            serde_json::Value::String(steam_language.into()),
-        );
-    let bytes = serde_json::to_vec_pretty(&root)?;
-    write_atomic(&path, &bytes).await
+    Ok(settings)
+}
+
+// A missing or unreadable version is zero, as in the DLL.
+fn settings_version(settings: &Map<String, Value>) -> u32 {
+    settings
+        .get("version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(0)
+}
+
+/** Missing keys take the default; existing values stay, including null and arrays. */
+fn add_missing_defaults(settings: &mut Map<String, Value>, defaults: &Map<String, Value>) {
+    for (key, default) in defaults {
+        match (settings.get_mut(key), default) {
+            (None, _) => {
+                settings.insert(key.clone(), default.clone());
+            }
+            (Some(Value::Object(existing)), Value::Object(default)) => {
+                add_missing_defaults(existing, default);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn without_byte_order_mark(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
 }
 
 async fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
@@ -257,29 +350,96 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::save_sunrise_language;
+    use serde_json::{Map, Value, json};
+
+    use super::{installed_language, merge_settings, settings_path};
+    use crate::models::InstallerState;
+
+    fn object(value: Value) -> Map<String, Value> {
+        match value {
+            Value::Object(object) => object,
+            _ => panic!("test value is not an object"),
+        }
+    }
+
+    fn defaults() -> Map<String, Value> {
+        object(json!({
+            "version": 18,
+            "video": { "fieldOfView": 70, "vsync": true },
+            "steam": { "language": "english", "user": { "name": "Guardian" } }
+        }))
+    }
+
+    #[test]
+    fn current_settings_keep_their_values_and_gain_new_defaults() {
+        let existing = object(json!({
+            "version": 18,
+            "video": { "fieldOfView": 90 },
+            "steam": { "language": "english", "offline": true }
+        }));
+        let merged = merge_settings(defaults(), Some(existing), "french").expect("merged");
+        assert_eq!(merged["version"], 18);
+        assert_eq!(merged["video"]["fieldOfView"], 90);
+        assert_eq!(merged["video"]["vsync"], true);
+        assert_eq!(merged["steam"]["offline"], true);
+        assert_eq!(merged["steam"]["user"]["name"], "Guardian");
+        assert_eq!(merged["steam"]["language"], "french");
+    }
+
+    #[test]
+    fn old_or_missing_settings_are_rebuilt_with_the_language() {
+        for existing in [
+            None,
+            Some(object(json!({ "steam": { "language": "german" } }))),
+            Some(object(
+                json!({ "version": 17, "video": { "fieldOfView": 90 } }),
+            )),
+        ] {
+            let merged = merge_settings(defaults(), existing, "german").expect("merged");
+            assert_eq!(merged["version"], 18);
+            assert_eq!(merged["video"]["fieldOfView"], 70);
+            assert_eq!(merged["steam"]["language"], "german");
+        }
+    }
 
     #[tokio::test]
-    async fn language_update_preserves_other_sunrise_settings() {
+    async fn installed_language_prefers_state_then_settings() {
         let temporary = tempfile::tempdir().expect("temporary installation");
-        let sunrise = temporary.path().join("bin").join("x64").join("Sunrise");
-        std::fs::create_dir_all(&sunrise).expect("Sunrise settings directory");
-        let settings = sunrise.join("settings.json");
+        assert!(installed_language(temporary.path(), None).await.is_none());
+
+        let settings = settings_path(temporary.path());
+        std::fs::create_dir_all(settings.parent().expect("settings folder"))
+            .expect("settings folder");
         std::fs::write(
             &settings,
-            br#"{"video":{"fieldOfView":90},"steam":{"offline":true}}"#,
+            b"\xEF\xBB\xBF{\"steam\":{\"language\":\"polish\"}}",
         )
-        .expect("existing settings");
+        .expect("settings file");
+        let legacy: InstallerState = serde_json::from_value(json!({
+            "releaseTag": "v1",
+            "releaseAsset": "steam_api64.dll",
+            "releaseAssetDigest": null,
+            "installedDllSha256": "aa",
+            "installedAtUtc": "2026-08-26T12:00:00+00:00",
+            "manifests": {}
+        }))
+        .expect("legacy state");
+        assert_eq!(
+            installed_language(temporary.path(), Some(&legacy))
+                .await
+                .map(|language| language.steam_language),
+            Some("polish")
+        );
 
-        save_sunrise_language(temporary.path(), "french")
-            .await
-            .expect("language setting update");
-
-        let saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(settings).expect("updated settings file"))
-                .expect("valid JSON settings");
-        assert_eq!(saved["steam"]["language"], "french");
-        assert_eq!(saved["steam"]["offline"], true);
-        assert_eq!(saved["video"]["fieldOfView"], 90);
+        let recorded = InstallerState {
+            steam_language: Some("german".into()),
+            ..legacy
+        };
+        assert_eq!(
+            installed_language(temporary.path(), Some(&recorded))
+                .await
+                .map(|language| language.steam_language),
+            Some("german")
+        );
     }
 }

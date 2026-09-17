@@ -69,6 +69,13 @@ pub async fn get_app_snapshot(app: AppHandle) -> AppResult<AppSnapshot> {
         storage::save_preferences(&app, &preferences).await?;
     }
     let installation = storage::inspect_installation(&preferences.install_directory).await?;
+    // Repair and Install use the selected language, so it starts as the installed one.
+    if let Some(installed) = installation.steam_language.as_ref()
+        && preferences.steam_language != *installed
+    {
+        preferences.steam_language = installed.clone();
+        storage::save_preferences(&app, &preferences).await?;
+    }
     let release_result = async {
         GitHubClient::new()?
             .latest_release("stanuwu", "Sunrise", "steam_api64.dll")

@@ -12,6 +12,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::{OperationEvent, ReleaseInfo};
 
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+// Mission scripts are text; a larger archive is not the scripts repository.
+const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct GitHubClient {
@@ -22,6 +24,11 @@ pub struct GitHubClient {
 struct ApiRelease {
     tag_name: String,
     assets: Vec<ApiAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiCommit {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +101,77 @@ impl GitHubClient {
             size: asset.size,
             digest: asset.digest,
         })
+    }
+
+    pub async fn latest_commit(
+        &self,
+        owner: &str,
+        repository: &str,
+        branch: &str,
+    ) -> AppResult<String> {
+        let url = format!("https://api.github.com/repos/{owner}/{repository}/commits/{branch}");
+        let response = self
+            .client
+            .get(url)
+            .header(USER_AGENT, "Project-Sunrise-Launcher/0.1")
+            .header(ACCEPT, "application/vnd.github+json")
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(AppError::message(format!(
+                "GitHub returned HTTP {} while checking {owner}/{repository}.",
+                response.status().as_u16()
+            )));
+        }
+        let commit: ApiCommit = response.json().await?;
+        if commit.sha.len() != 40 || !commit.sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AppError::message(format!(
+                "GitHub returned an invalid commit for {owner}/{repository}."
+            )));
+        }
+        Ok(commit.sha)
+    }
+
+    /** Downloads a source archive, which GitHub publishes without a size or digest. */
+    pub async fn download_source(
+        &self,
+        owner: &str,
+        repository: &str,
+        commit: &str,
+        destination: &Path,
+    ) -> AppResult<()> {
+        let url = format!("https://codeload.github.com/{owner}/{repository}/zip/{commit}");
+        let mut response = self
+            .client
+            .get(url)
+            .header(USER_AGENT, "Project-Sunrise-Launcher/0.1")
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(AppError::message(format!(
+                "GitHub returned HTTP {} while downloading {owner}/{repository}.",
+                response.status().as_u16()
+            )));
+        }
+        let mut file = tokio::fs::File::create(destination)
+            .await
+            .map_err(|error| AppError::io("Could not create the download file", error))?;
+        let mut downloaded = 0_u64;
+        while let Some(chunk) = response.chunk().await? {
+            downloaded = downloaded.saturating_add(chunk.len() as u64);
+            if downloaded > MAX_SOURCE_BYTES {
+                return Err(AppError::message(
+                    "The download is larger than the safety limit.",
+                ));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| AppError::io("Could not write the download", error))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| AppError::io("Could not finish the download", error))
     }
 
     pub async fn download(

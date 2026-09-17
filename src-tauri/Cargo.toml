@@ -28,6 +28,7 @@ chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
 futures-util = "0.3"
 hex = "0.4"
+pelite = { version = "0.10", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 sha2 = "0.10"
 tempfile = "3"

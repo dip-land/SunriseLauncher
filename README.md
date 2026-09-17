@@ -2,7 +2,9 @@
 
 A Tauri 2 installer and launcher for [Project Sunrise](https://github.com/stanuwu/Sunrise), the Destiny 2 offline exploration mod.
 
-This repository is an early functional rewrite of [SunriseInstaller](https://github.com/stanuwu/SunriseInstaller). The interface, filesystem access, downloads, hashing, and child-process orchestration are split across a TypeScript frontend and a Rust backend. Steam credentials are handled by DepotDownloader and are never persisted by the launcher.
+This repository is a rewrite of [SunriseInstaller](https://github.com/stanuwu/SunriseInstaller). The interface, filesystem access, downloads, hashing, and child-process orchestration are split across a TypeScript frontend and a Rust backend. Steam credentials are handled by DepotDownloader and are never persisted by the launcher.
+
+Made by (zeex64)[https://github.com/zeex64], maintained by (stanuwu)[https://github.com/stanuwu]
 
 ## Platform support
 
@@ -17,12 +19,15 @@ This repository is an early functional rewrite of [SunriseInstaller](https://git
 ## Current installer flow
 
 1. Validate the target folder, write access, and free space.
-2. Download the matching native DepotDownloader release for the host OS/architecture.
+2. Download the pinned DepotDownloader 3.4.0 build for the host OS/architecture and check its SHA-256.
 3. Stream DepotDownloader output into the in-app console for QR/Steam Guard authentication.
 4. Download the pinned shared depot and the selected language depot.
 5. Download `steam_api64.dll` from the latest Sunrise GitHub release.
-6. Verify GitHub's SHA-256 digest, preserve rollback/original copies, and install the DLL.
-7. Save a compatible `.sunrise/install-state.json` for update and integrity checks.
+6. Install the latest commit of [SunriseMissions](https://github.com/stanuwu/SunriseMissions) into `bin/x64/Sunrise/scripts`. A scripts folder that is a git checkout is left alone.
+7. Verify GitHub's SHA-256 digest, preserve rollback/original copies, and install the DLL.
+8. Save a compatible `.sunrise/install-state.json` for update and integrity checks.
+
+Settings has an **Update missions** button that replaces the scripts folder with the latest missions at any time.
 
 The shared Windows depot is `1085661`, manifest `7180122903232116872`.
 One language depot is selected during Install or Repair:

@@ -25,6 +25,8 @@ type InstallationSnapshot = {
   installedReleaseDigest: string | null;
   installedAt: string | null;
   localFileChanged: boolean;
+  steamLanguage: string | null;
+  missionsCommit: string | null;
 };
 type ReleaseInfo = {
   tag: string;
@@ -41,7 +43,7 @@ type AppSnapshot = {
   updateAvailable: boolean;
   releaseError: string | null;
 };
-type OperationKind = "install" | "repair" | "update";
+type OperationKind = "install" | "repair" | "update" | "missions";
 type OperationEvent =
   | { event: "progress"; stage: string; message: string; percent: number }
   | { event: "terminal"; stream: string; text: string }
@@ -81,6 +83,7 @@ const gameLanguage = element<HTMLSelectElement>("#game-language");
 const primaryAction = element<HTMLButtonElement>("#primary-action");
 const primaryLabel = element<HTMLElement>("#primary-label");
 const repairAction = element<HTMLButtonElement>("#repair-action");
+const missionsAction = element<HTMLButtonElement>("#missions-action");
 const launchAction = element<HTMLButtonElement>("#launch-action");
 const consoleOutput = element<HTMLElement>("#console-output");
 const toast = element<HTMLElement>("#toast");
@@ -120,6 +123,7 @@ let setupDraft: Preferences = {
   authMethod: "qr",
 };
 let setupInspection: InstallationSnapshot | null = null;
+let setupLanguageFolder = "";
 let activeAuthMethod: AuthMethod = "qr";
 let activeAuthPrompt: "password" | "twoFactor" | "emailCode" | null = null;
 let authSessionReady = false;
@@ -171,6 +175,8 @@ const mockSnapshot: AppSnapshot = {
     installedReleaseDigest: null,
     installedAt: null,
     localFileChanged: false,
+    steamLanguage: null,
+    missionsCommit: null,
   },
   latestRelease: {
     tag: "0.3.2",
@@ -200,6 +206,8 @@ async function invokeCommand<T>(command: string, args: Record<string, unknown> =
         installedReleaseDigest: null,
         installedAt: null,
         localFileChanged: false,
+        steamLanguage: null,
+        missionsCommit: null,
       } as T;
     }
     return {
@@ -212,6 +220,8 @@ async function invokeCommand<T>(command: string, args: Record<string, unknown> =
       installedReleaseDigest: null,
       installedAt: null,
       localFileChanged: false,
+      steamLanguage: null,
+      missionsCommit: null,
     } as T;
   }
   if (command === "run_operation") {
@@ -264,6 +274,8 @@ async function invokeCommand<T>(command: string, args: Record<string, unknown> =
       installedReleaseDigest: mockSnapshot.latestRelease?.digest ?? null,
       installedAt: new Date().toISOString(),
       localFileChanged: false,
+      steamLanguage: mockSnapshot.preferences.steamLanguage,
+      missionsCommit: "0000000000000000000000000000000000000000",
     };
     mockSnapshot.updateAvailable = false;
     return { changed: true, releaseTag: "0.3.2", message: "Preview operation complete." } as T;
@@ -322,6 +334,7 @@ function renderSnapshot(data: AppSnapshot) {
   element("#health-ring").className = `health-ring ${copy.className}`;
   element("#health-icon").textContent = copy.icon;
   element("#installed-release").textContent = data.installation.installedRelease ?? "—";
+  element("#installed-missions").textContent = data.installation.missionsCommit?.slice(0, 7) ?? "—";
   element("#available-release").textContent = data.latestRelease?.tag ?? "Unavailable";
   element("#latest-release").textContent = data.latestRelease?.tag ?? "Offline";
   element("#installed-at").textContent = data.installation.installedAt
@@ -358,6 +371,7 @@ function renderSnapshot(data: AppSnapshot) {
   const supported = data.platform.level !== "unsupported";
   primaryAction.disabled = operationRunning || gameLaunching || !supported;
   repairAction.disabled = operationRunning || gameLaunching || !data.installation.gameFound;
+  missionsAction.disabled = repairAction.disabled;
   launchAction.disabled = operationRunning || gameLaunching || !data.installation.gameFound || !data.platform.canLaunch;
 }
 
@@ -370,10 +384,10 @@ async function loadSnapshot(useInputs = false) {
     } else if (installDirectory.value !== data.preferences.installDirectory) {
       data.preferences.installDirectory = installDirectory.value;
       data.preferences.steamUsername = steamUsername.value;
-      data.preferences.steamLanguage = gameLanguage.value;
       data.installation = await invokeCommand<InstallationSnapshot>("inspect_installation", {
         installDirectory: installDirectory.value,
       });
+      data.preferences.steamLanguage = data.installation.steamLanguage ?? gameLanguage.value;
     }
     renderSnapshot(data);
   } catch (error) {
@@ -391,10 +405,14 @@ async function saveAndInspect() {
     authMethod: snapshot?.preferences.authMethod ?? "qr",
   };
   try {
-    await invokeCommand("save_preferences", { preferences });
     const installation = await invokeCommand<InstallationSnapshot>("inspect_installation", {
       installDirectory: preferences.installDirectory,
     });
+    // A newly chosen folder starts at its installed language; the user may then change it.
+    if (installation.steamLanguage && preferences.installDirectory !== snapshot?.preferences.installDirectory) {
+      preferences.steamLanguage = installation.steamLanguage;
+    }
+    await invokeCommand("save_preferences", { preferences });
     if (snapshot) renderSnapshot({ ...snapshot, preferences, installation });
   } catch (error) {
     showToast(String(error), "error");
@@ -529,6 +547,7 @@ function openSetup() {
     authMethod: snapshot?.preferences.authMethod ?? "qr",
   };
   setupInspection = snapshot?.installation ?? null;
+  setupLanguageFolder = "";
   setupStep = 0;
   renderSetupStep();
   setOverlay(setupView, true);
@@ -556,6 +575,10 @@ async function advanceSetup() {
     setupDraft.installDirectory = setupInstallDirectory.value.trim();
     const installation = await inspectSetupDirectory(setupDraft.installDirectory, true);
     if (!installation) return;
+    if (installation.steamLanguage && setupLanguageFolder !== setupDraft.installDirectory) {
+      setupDraft.steamLanguage = installation.steamLanguage;
+    }
+    setupLanguageFolder = setupDraft.installDirectory;
     setupStep = 1;
     renderSetupStep();
     window.requestAnimationFrame(() => setupSteamUsername.focus());
@@ -748,19 +771,27 @@ function resetOperation(kind: OperationKind) {
   window.clearTimeout(operationHideTimer);
   operationStrip.hidden = false;
   consoleOutput.textContent = "";
-  element("#operation-notice").textContent = activeAuthMethod === "qr"
-    ? "The first depot will ask you to scan a Steam QR code."
-    : "DepotDownloader will ask for your password and Steam Guard code.";
+  element("#operation-notice").textContent = kind !== "install" && kind !== "repair"
+    ? ""
+    : activeAuthMethod === "qr"
+      ? "The first depot will ask you to scan a Steam QR code."
+      : "DepotDownloader will ask for your password and Steam Guard code.";
 }
 
 function updateOperationStep(stage: string, message: string) {
   let label = "INSTALLING SUNRISE";
 
-  if (stage === "depots") {
+  const downloadsGame = activeOperationKind === "install" || activeOperationKind === "repair";
+
+  if (activeOperationKind === "missions") {
+    label = "UPDATING MISSIONS";
+  } else if (stage === "missions") {
+    label = "INSTALLING MISSIONS";
+  } else if (stage === "depots") {
     label = message.trimStart().toLowerCase().startsWith("validating")
       ? "VALIDATING DESTINY 2"
       : "DOWNLOADING DESTINY 2";
-  } else if (stage === "tool" || (stage === "preflight" && activeOperationKind !== "update")) {
+  } else if (stage === "tool" || (stage === "preflight" && downloadsGame)) {
     label = "DOWNLOADING DEPOTDOWNLOADER";
   } else if (stage === "repair") {
     label = "REPAIRING SUNRISE";
@@ -856,10 +887,11 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
   operationCancellationRequested = false;
   resetOperation(kind);
   closeSettings();
-  if (kind !== "update") prepareAuth(operationPreferences.authMethod);
+  if (kind === "install" || kind === "repair") prepareAuth(operationPreferences.authMethod);
   element<HTMLButtonElement>("#cancel-action").disabled = false;
   primaryAction.disabled = true;
   repairAction.disabled = true;
+  missionsAction.disabled = true;
   launchAction.disabled = true;
   installDirectory.disabled = true;
   steamUsername.disabled = true;
@@ -1042,6 +1074,7 @@ window.addEventListener("DOMContentLoaded", () => {
     else runOperation(primaryMode);
   });
   repairAction.addEventListener("click", () => runOperation("repair"));
+  missionsAction.addEventListener("click", () => runOperation("missions"));
   launchAction.addEventListener("click", () => {
     closeSettings();
     launch();

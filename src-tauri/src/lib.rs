@@ -1,11 +1,28 @@
 mod commands;
+mod depot_errors;
 mod error;
 mod github;
 mod installer;
+mod missions;
 mod models;
 mod storage;
 
-use tauri::Manager;
+use tauri::{Manager, WebviewWindow};
+
+// The layout is drawn for this window size in logical pixels; larger windows zoom it.
+const DESIGN_WIDTH: f64 = 1180.0;
+const DESIGN_HEIGHT: f64 = 680.0;
+
+fn fit_zoom(window: &WebviewWindow) {
+    let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) else {
+        return;
+    };
+    let size = size.to_logical::<f64>(scale);
+    let zoom = (size.width / DESIGN_WIDTH)
+        .min(size.height / DESIGN_HEIGHT)
+        .max(1.0);
+    let _ = window.set_zoom(zoom);
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -13,7 +30,20 @@ pub fn run() {
         .manage(commands::OperationState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                fit_zoom(&window);
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. }
+            ) && let Some(webview) = window.app_handle().get_webview_window(window.label())
+            {
+                fit_zoom(&webview);
+            }
             if matches!(
                 event,
                 tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed

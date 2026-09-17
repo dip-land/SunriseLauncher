@@ -11,12 +11,14 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
+use crate::depot_errors::{DepotFailure, DepotFailureScanner};
 use crate::error::{AppError, AppResult};
 use crate::github::GitHubClient;
+use crate::missions;
 use crate::models::{
-    AuthMethod, BASE_DEPOT, DepotSpec, FRESH_INSTALL_BYTES, GAME_EXECUTABLE, LanguageSpec,
-    OperationEvent, OperationKind, OperationRequest, OperationResult, REPAIR_BYTES, ReleaseInfo,
-    STEAM_APP_ID, UPDATE_BYTES, depots_for, resolve_language,
+    AuthMethod, BASE_DEPOT, DepotSpec, FRESH_INSTALL_BYTES, GAME_EXECUTABLE, InstallerState,
+    LanguageSpec, OperationEvent, OperationKind, OperationRequest, OperationResult, REPAIR_BYTES,
+    ReleaseInfo, STEAM_APP_ID, UPDATE_BYTES, depots_for, resolve_language,
 };
 use crate::storage;
 
@@ -35,7 +37,7 @@ pub async fn run(
         OperationKind::Install if existing_game => REPAIR_BYTES,
         OperationKind::Install => FRESH_INSTALL_BYTES,
         OperationKind::Repair => REPAIR_BYTES,
-        OperationKind::Update => UPDATE_BYTES,
+        OperationKind::Update | OperationKind::Missions => UPDATE_BYTES,
     };
     progress(
         &on_event,
@@ -49,30 +51,38 @@ pub async fn run(
     );
     let root = prepare_install_root(&request.install_directory, required)?;
     ensure_game_closed()?;
+    if matches!(request.kind, OperationKind::Missions) {
+        return update_missions(&root, &on_event).await;
+    }
     let requested_language = *resolve_language(&request.steam_language);
     let existing_state = storage::load_state(&root).await?;
+    let installed_language = storage::installed_language(&root, existing_state.as_ref())
+        .await
+        .copied();
     let operation_language = if matches!(request.kind, OperationKind::Update) {
-        existing_state
-            .as_ref()
-            .map(|state| *resolve_language(&state.steam_language))
-            .unwrap_or(requested_language)
+        installed_language.unwrap_or(requested_language)
     } else {
         requested_language
     };
-    let previous_language = existing_state.as_ref().and_then(|state| {
-        let previous = *resolve_language(&state.steam_language);
-        (!previous
-            .steam_language
-            .eq_ignore_ascii_case(operation_language.steam_language))
-        .then(|| {
-            let manifest_id = state
-                .manifests
-                .get(&previous.depot.depot_id)
-                .copied()
-                .unwrap_or(previous.depot.manifest_id);
-            (previous, manifest_id)
-        })
-    });
+    // Old files are only known for an install this launcher or the old installer recorded.
+    let previous_language =
+        existing_state
+            .as_ref()
+            .zip(installed_language)
+            .and_then(|(state, previous)| {
+                (previous.steam_language != operation_language.steam_language).then(|| {
+                    let manifest_id = state
+                        .manifests
+                        .get(&previous.depot.depot_id)
+                        .copied()
+                        .unwrap_or(previous.depot.manifest_id);
+                    (previous, manifest_id)
+                })
+            });
+    let mut obsolete_files = existing_state
+        .as_ref()
+        .map(|state| state.pending_language_files.clone())
+        .unwrap_or_default();
 
     if !matches!(request.kind, OperationKind::Install) {
         verify_game_files(&root)?;
@@ -97,14 +107,14 @@ pub async fn run(
         .await?;
         verify_game_files(&root)?;
         if let Some((previous, previous_manifest_id)) = previous_language {
-            switch_language_files(
+            obsolete_files = find_obsolete_language_files(
                 &downloader,
-                &root,
                 request.steam_username.trim(),
                 request.auth_method,
                 &previous,
                 previous_manifest_id,
                 &operation_language,
+                obsolete_files,
                 &on_event,
                 &cancel,
                 terminal_input.clone(),
@@ -136,6 +146,9 @@ pub async fn run(
     if matches!(request.kind, OperationKind::Update)
         && installation_is_current(&root, &release).await?
     {
+        if let Some(state) = existing_state {
+            finish_language_cleanup(&root, state, &on_event).await?;
+        }
         progress(
             &on_event,
             "complete",
@@ -163,6 +176,28 @@ pub async fn run(
         .await?;
     cancel_check(&cancel)?;
 
+    let settings = storage::prepare_sunrise_settings(
+        &root,
+        &payload,
+        operation_language.steam_language,
+        matches!(request.kind, OperationKind::Repair),
+    )
+    .await?;
+    // Install and Repair start without scripts; Repair deleted them with the Sunrise data.
+    let missions_commit = if matches!(request.kind, OperationKind::Update) {
+        existing_state
+            .as_ref()
+            .and_then(|state| state.missions_commit.clone())
+    } else if missions::is_git_checkout(&root) {
+        let _ = on_event.send(OperationEvent::Notice {
+            message: "The scripts folder is a git checkout, so the missions were left as they are."
+                .into(),
+        });
+        None
+    } else {
+        progress(&on_event, "missions", "Installing the latest missions…", 97);
+        Some(missions::install_latest(&github, &root).await?)
+    };
     progress(&on_event, "install", "Installing Sunrise…", 98);
     install_payload(
         &root,
@@ -171,9 +206,7 @@ pub async fn run(
         matches!(request.kind, OperationKind::Install | OperationKind::Repair),
     )
     .await?;
-    if matches!(request.kind, OperationKind::Install | OperationKind::Repair) {
-        storage::save_sunrise_language(&root, operation_language.steam_language).await?;
-    }
+    storage::write_sunrise_settings(&root, &settings).await?;
     let manifests = if matches!(request.kind, OperationKind::Update) {
         existing_state
             .as_ref()
@@ -182,26 +215,54 @@ pub async fn run(
     } else {
         language_manifests(&operation_language)
     };
-    let state = storage::new_state(
-        release.tag.clone(),
-        release.asset_name.clone(),
-        release.digest.clone(),
-        payload_hash,
-        operation_language.steam_language.into(),
+    let state = InstallerState {
+        schema_version: 2,
+        app_id: STEAM_APP_ID,
+        release_tag: release.tag.clone(),
+        release_asset: release.asset_name.clone(),
+        release_asset_digest: release.digest.clone(),
+        installed_dll_sha256: payload_hash,
+        installed_at_utc: chrono::Utc::now(),
+        steam_language: Some(operation_language.steam_language.into()),
         manifests,
-    );
+        pending_language_files: obsolete_files,
+        missions_commit,
+    };
+    // The new language is saved before old files go, so an interrupted cleanup still boots.
     storage::save_state(&root, &state).await?;
+    finish_language_cleanup(&root, state, &on_event).await?;
 
     let verb = match request.kind {
         OperationKind::Install => "Installed",
         OperationKind::Repair => "Repaired",
-        OperationKind::Update => "Updated",
+        OperationKind::Update | OperationKind::Missions => "Updated",
     };
     let message = format!("{verb} Sunrise {} successfully.", release.tag);
     progress(&on_event, "complete", &message, 100);
     Ok(OperationResult {
         changed: true,
         release_tag: release.tag,
+        message,
+    })
+}
+
+async fn update_missions(
+    root: &Path,
+    on_event: &Channel<OperationEvent>,
+) -> AppResult<OperationResult> {
+    verify_game_files(root)?;
+    progress(on_event, "missions", "Downloading the latest missions…", 10);
+    let commit = missions::install_latest(&GitHubClient::new()?, root).await?;
+    if let Some(mut state) = storage::load_state(root).await? {
+        state.missions_commit = Some(commit.clone());
+        storage::save_state(root, &state).await?;
+    }
+    let short = &commit[..7];
+    let message = format!("Installed missions {short}.");
+    progress(on_event, "complete", &message, 100);
+    Ok(OperationResult {
+        changed: true,
+        release_tag: short.into(),
         message,
     })
 }
@@ -230,7 +291,7 @@ fn cancel_check(cancel: &CancellationToken) -> AppResult<()> {
 }
 
 fn validate_username(kind: OperationKind, username: &str) -> AppResult<()> {
-    if matches!(kind, OperationKind::Update) {
+    if matches!(kind, OperationKind::Update | OperationKind::Missions) {
         return Ok(());
     }
     if username.trim().is_empty() {
@@ -356,10 +417,7 @@ async fn ensure_depot_downloader(
     on_event: &Channel<OperationEvent>,
     cancel: &CancellationToken,
 ) -> AppResult<PathBuf> {
-    let asset_name = depot_asset_name()?;
-    let release = github
-        .latest_release("SteamRE", "DepotDownloader", asset_name)
-        .await?;
+    let release = depot_downloader_release()?;
     let versions = storage::app_data_dir(app)?
         .join("tools")
         .join("DepotDownloader")
@@ -403,18 +461,74 @@ async fn ensure_depot_downloader(
     Ok(executable)
 }
 
-fn depot_asset_name() -> AppResult<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Ok("DepotDownloader-windows-x64.zip"),
-        ("windows", "aarch64") => Ok("DepotDownloader-windows-arm64.zip"),
-        ("linux", "x86_64") => Ok("DepotDownloader-linux-x64.zip"),
-        ("linux", "aarch64") => Ok("DepotDownloader-linux-arm64.zip"),
-        ("macos", "x86_64") => Ok("DepotDownloader-macos-x64.zip"),
-        ("macos", "aarch64") => Ok("DepotDownloader-macos-arm64.zip"),
-        (os, arch) => Err(AppError::message(format!(
-            "DepotDownloader does not publish an asset for {os}/{arch}."
-        ))),
-    }
+// The output parsers match this release's text; re-check them before changing the pin.
+const DEPOT_DOWNLOADER_TAG: &str = "DepotDownloader_3.4.0";
+
+// Asset name, size in bytes and SHA-256 per platform. GitHub publishes no digest for this release.
+const DEPOT_DOWNLOADER_ASSETS: [(&str, &str, &str, u64, &str); 6] = [
+    (
+        "windows",
+        "x86_64",
+        "DepotDownloader-windows-x64.zip",
+        33_474_005,
+        "41c9e9f0df54b3ad02e67a11726756e5c73283bd7c2e1b04acfa5ae4c2ed3767",
+    ),
+    (
+        "windows",
+        "aarch64",
+        "DepotDownloader-windows-arm64.zip",
+        32_428_618,
+        "1449ba47775e9974036e615bedf00d72bef747cc5b93a78048ed4e0b2c63b2b3",
+    ),
+    (
+        "linux",
+        "x86_64",
+        "DepotDownloader-linux-x64.zip",
+        33_442_357,
+        "a999dec66b4850fc961bd50366696d23c2d0fad7b18790e6a5647b2f19097a53",
+    ),
+    (
+        "linux",
+        "aarch64",
+        "DepotDownloader-linux-arm64.zip",
+        32_026_406,
+        "d9fb612ccebc1db8eeea3b4045d2221ec70431381393ce908fb72f01d4f9c812",
+    ),
+    (
+        "macos",
+        "x86_64",
+        "DepotDownloader-macos-x64.zip",
+        33_808_980,
+        "3214b689564d73e9342a8a4aef693de6ad3d293801b0f300a4466f60ec75befb",
+    ),
+    (
+        "macos",
+        "aarch64",
+        "DepotDownloader-macos-arm64.zip",
+        32_245_964,
+        "60e80c7c496f3f9a079cd3c62036b35d088c27bc0149baf38f009eb57a52f6a5",
+    ),
+];
+
+fn depot_downloader_release() -> AppResult<ReleaseInfo> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let (_, _, asset_name, size, sha256) = DEPOT_DOWNLOADER_ASSETS
+        .into_iter()
+        .find(|asset| asset.0 == os && asset.1 == arch)
+        .ok_or_else(|| {
+            AppError::message(format!(
+                "DepotDownloader does not publish an asset for {os}/{arch}."
+            ))
+        })?;
+    Ok(ReleaseInfo {
+        tag: DEPOT_DOWNLOADER_TAG.into(),
+        asset_name: asset_name.into(),
+        download_url: format!(
+            "https://github.com/SteamRE/DepotDownloader/releases/download/{DEPOT_DOWNLOADER_TAG}/{asset_name}"
+        ),
+        size,
+        digest: Some(format!("sha256:{sha256}")),
+    })
 }
 
 fn find_depot_executable(root: &Path) -> Option<PathBuf> {
@@ -449,7 +563,7 @@ fn sanitize_name(value: &str) -> String {
         .collect()
 }
 
-fn extract_zip(archive_path: &Path, destination: &Path) -> AppResult<()> {
+pub(crate) fn extract_zip(archive_path: &Path, destination: &Path) -> AppResult<()> {
     let file = std::fs::File::open(archive_path)
         .map_err(|error| AppError::io("Could not open the downloaded archive", error))?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -546,19 +660,20 @@ async fn download_depots(
     Ok(())
 }
 
+/** Lists the previous language's files, plus older leftovers, that the new language does not use. */
 #[allow(clippy::too_many_arguments)]
-async fn switch_language_files(
+async fn find_obsolete_language_files(
     executable: &Path,
-    install_root: &Path,
     steam_username: &str,
     auth_method: AuthMethod,
     previous_language: &LanguageSpec,
     previous_manifest_id: u64,
     selected_language: &LanguageSpec,
+    pending_files: Vec<String>,
     on_event: &Channel<OperationEvent>,
     cancel: &CancellationToken,
     terminal_input: Arc<AsyncMutex<Option<ChildStdin>>>,
-) -> AppResult<()> {
+) -> AppResult<Vec<String>> {
     progress(
         on_event,
         "language",
@@ -604,17 +719,16 @@ async fn switch_language_files(
         .chain(&selected_files)
         .map(|path| normalize_manifest_path(path))
         .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
     let obsolete_files = previous_files
         .into_iter()
-        .filter(|path| !keep_files.contains(&normalize_manifest_path(path)))
+        .chain(pending_files)
+        .map(|path| path.replace('\\', "/"))
+        .filter(|path| {
+            let normalized = normalize_manifest_path(path);
+            !keep_files.contains(&normalized) && seen.insert(normalized)
+        })
         .collect::<Vec<_>>();
-    let removed = remove_depot_files(install_root, &obsolete_files)?;
-    let _ = on_event.send(OperationEvent::Notice {
-        message: format!(
-            "Selected {} and removed {removed} obsolete {} language file(s).",
-            selected_language.display_name, previous_language.display_name
-        ),
-    });
     progress(
         on_event,
         "language",
@@ -624,6 +738,29 @@ async fn switch_language_files(
         ),
         88,
     );
+    Ok(obsolete_files)
+}
+
+async fn finish_language_cleanup(
+    install_root: &Path,
+    mut state: InstallerState,
+    on_event: &Channel<OperationEvent>,
+) -> AppResult<()> {
+    if state.pending_language_files.is_empty() {
+        return Ok(());
+    }
+    let removed = remove_depot_files(install_root, &state.pending_language_files).map_err(
+        |error| {
+            AppError::message(format!(
+                "Sunrise is installed, but some old language files could not be removed. Run Check or Update again to finish. {error}"
+            ))
+        },
+    )?;
+    state.pending_language_files.clear();
+    storage::save_state(install_root, &state).await?;
+    let _ = on_event.send(OperationEvent::Notice {
+        message: format!("Removed {removed} old language file(s)."),
+    });
     Ok(())
 }
 
@@ -821,13 +958,17 @@ async fn run_depot(
         }
     };
     *terminal_input.lock().await = None;
-    if let Some(task) = stdout_task {
-        let _ = task.await;
-    }
-    if let Some(task) = stderr_task {
-        let _ = task.await;
+    let mut failure = None;
+    for task in [stdout_task, stderr_task].into_iter().flatten() {
+        if let Ok(Some(found)) = task.await {
+            failure.get_or_insert(found);
+        }
     }
     let status = outcome?;
+    // DepotDownloader exits 0 when a depot is refused, so a reported failure wins.
+    if let Some(failure) = failure {
+        return Err(AppError::message(failure.refine(install_root).message()));
+    }
     if !status.success() {
         return Err(AppError::message(format!(
             "DepotDownloader stopped with exit code {}. The captured output is available in Settings for diagnostics.",
@@ -946,6 +1087,7 @@ struct TerminalEventParser {
     auth_prompts: AuthPromptScanner,
     auth_completion: AuthCompletionScanner,
     depot_progress: Option<DepotProgress>,
+    failures: DepotFailureScanner,
 }
 
 impl TerminalEventParser {
@@ -956,6 +1098,7 @@ impl TerminalEventParser {
             auth_prompts: AuthPromptScanner::default(),
             auth_completion: AuthCompletionScanner::default(),
             depot_progress,
+            failures: DepotFailureScanner::default(),
         }
     }
 
@@ -986,6 +1129,7 @@ impl TerminalEventParser {
     }
 
     fn observe_line(&mut self, line: &str, on_event: &Channel<OperationEvent>) {
+        self.failures.observe_line(line);
         if let Some(progress) = self.depot_progress.as_mut()
             && let Some(update) = progress.observe_line(line)
         {
@@ -1083,11 +1227,20 @@ fn terminal_file_name(path: &str) -> Option<&str> {
         .find(|component| !component.is_empty())
 }
 
-const AUTH_PROMPT_DEFINITIONS: [(&str, &str, &str); 4] = [
+const CODE_REJECTED_MARKER: &str = "previous 2-factor auth code you have provided is incorrect";
+const CODE_REJECTED_MESSAGE: &str = "Steam did not accept that code. Enter a new Steam Guard code.";
+
+const AUTH_PROMPT_DEFINITIONS: [(&str, &str, &str); 6] = [
+    (CODE_REJECTED_MARKER, "codeRejected", CODE_REJECTED_MESSAGE),
     (
         "enter account password",
         "password",
         "Enter your Steam password",
+    ),
+    (
+        "enter the auth code sent to the email",
+        "emailCode",
+        "Enter the Steam Guard code sent to your email",
     ),
     (
         "enter your 2-factor auth code",
@@ -1109,6 +1262,7 @@ const AUTH_PROMPT_DEFINITIONS: [(&str, &str, &str); 4] = [
 #[derive(Default)]
 struct AuthPromptScanner {
     buffer: String,
+    code_rejected: bool,
 }
 
 impl AuthPromptScanner {
@@ -1130,8 +1284,15 @@ impl AuthPromptScanner {
             let Some((start, definition)) = next else {
                 break;
             };
-            prompts.push((definition.1, definition.2));
             scan_from = start + definition.0.len();
+            // A rejected code is followed by a new prompt, which carries the retry message.
+            if definition.1 == "codeRejected" {
+                self.code_rejected = true;
+            } else if definition.1 != "password" && std::mem::take(&mut self.code_rejected) {
+                prompts.push((definition.1, CODE_REJECTED_MESSAGE));
+            } else {
+                prompts.push((definition.1, definition.2));
+            }
         }
 
         if scan_from > 0 {
@@ -1215,7 +1376,7 @@ fn stream_output<R>(
     stream: &'static str,
     on_event: Channel<OperationEvent>,
     depot_progress: Option<DepotProgress>,
-) -> tokio::task::JoinHandle<()>
+) -> tokio::task::JoinHandle<Option<DepotFailure>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -1248,6 +1409,7 @@ where
             });
         }
         parser.finish(&on_event);
+        parser.failures.failure()
     })
 }
 
@@ -1332,7 +1494,7 @@ async fn install_payload(
 mod tests {
     use super::{
         AuthCompletionScanner, AuthPromptScanner, DepotProgress, QrCapture, TerminalDecoder,
-        authentication_args, depot_asset_name, parse_depot_file, parse_manifest_file,
+        authentication_args, depot_downloader_release, parse_depot_file, parse_manifest_file,
         parse_validating_file, remove_depot_files, sanitize_name,
     };
     use crate::models::AuthMethod;
@@ -1414,6 +1576,25 @@ mod tests {
         );
         assert_eq!(first[0].0, "twoFactor");
         assert_eq!(retry[0].0, "twoFactor");
+    }
+
+    #[test]
+    fn auth_scanner_marks_a_rejected_code_on_the_next_prompt() {
+        let mut scanner = AuthPromptScanner::default();
+        let retry = scanner.push(
+            "The previous 2-factor auth code you have provided is incorrect.\nSTEAM GUARD! Please enter your 2-factor auth code from your authenticator app: ",
+        );
+        assert_eq!(retry, vec![("twoFactor", super::CODE_REJECTED_MESSAGE)]);
+        let next = scanner.push("STEAM GUARD! Please enter your 2-factor auth code: ");
+        assert_ne!(next[0].1, super::CODE_REJECTED_MESSAGE);
+    }
+
+    #[test]
+    fn auth_scanner_detects_the_steamkit_email_prompt() {
+        let mut scanner = AuthPromptScanner::default();
+        let prompts = scanner
+            .push("STEAM GUARD! Please enter the auth code sent to the email at s***@gmail.com: ");
+        assert_eq!(prompts[0].0, "emailCode");
     }
 
     #[test]
@@ -1525,7 +1706,7 @@ mod tests {
         if matches!(std::env::consts::OS, "windows" | "linux" | "macos")
             && matches!(std::env::consts::ARCH, "x86_64" | "aarch64")
         {
-            assert!(depot_asset_name().is_ok());
+            assert!(depot_downloader_release().is_ok());
         }
     }
 }

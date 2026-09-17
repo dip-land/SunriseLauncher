@@ -166,9 +166,15 @@ pub struct InstallerState {
     pub release_asset_digest: Option<String>,
     pub installed_dll_sha256: String,
     pub installed_at_utc: DateTime<Utc>,
-    #[serde(default = "default_steam_language")]
-    pub steam_language: String,
+    // Absent in the first state schema; the language then comes from settings.json.
+    #[serde(default)]
+    pub steam_language: Option<String>,
     pub manifests: BTreeMap<u32, u64>,
+    // Old language files still to delete; the list is for the recorded language.
+    #[serde(default)]
+    pub pending_language_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missions_commit: Option<String>,
 }
 
 fn schema_version() -> u8 {
@@ -193,6 +199,8 @@ pub struct InstallationSnapshot {
     pub installed_release_digest: Option<String>,
     pub installed_at: Option<DateTime<Utc>>,
     pub local_file_changed: bool,
+    pub steam_language: Option<String>,
+    pub missions_commit: Option<String>,
 }
 
 impl InstallationSnapshot {
@@ -205,6 +213,8 @@ impl InstallationSnapshot {
             installed_release_digest: None,
             installed_at: None,
             local_file_changed: false,
+            steam_language: None,
+            missions_commit: None,
         }
     }
 
@@ -252,6 +262,7 @@ pub enum OperationKind {
     Install,
     Repair,
     Update,
+    Missions,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -352,6 +363,8 @@ mod tests {
             installed_release_digest: digest.map(str::to_owned),
             installed_at: None,
             local_file_changed: false,
+            steam_language: None,
+            missions_commit: None,
         }
     }
 
@@ -391,7 +404,8 @@ mod tests {
         .expect("legacy state should remain compatible");
 
         assert_eq!(state.release_tag, "v1.2.3");
-        assert_eq!(state.steam_language, "english");
+        assert_eq!(state.steam_language, None);
+        assert!(state.pending_language_files.is_empty());
         assert_eq!(state.release_asset_digest.as_deref(), Some("sha256:aabb"));
         assert_eq!(
             state.manifests.get(&1_085_661),
