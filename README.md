@@ -1,10 +1,10 @@
 # Project Sunrise Launcher
 
-A Tauri 2 installer and launcher for [Project Sunrise](https://github.com/stanuwu/Sunrise), the Destiny 2 offline exploration mod.
-
-This repository is a rewrite of [SunriseInstaller](https://github.com/stanuwu/SunriseInstaller). The interface, filesystem access, downloads, hashing, and child-process orchestration are split across a TypeScript frontend and a Rust backend. Steam credentials are handled by DepotDownloader and are never persisted by the launcher.
+Official launcher for [Project Sunrise](https://github.com/stanuwu/Sunrise), the Destiny 2 preservation mod.
 
 Made by [zeex64](https://github.com/zeex64), maintained by [stanuwu](https://github.com/stanuwu)
+
+This repository is a rewrite of [SunriseInstaller](https://github.com/stanuwu/SunriseInstaller). The interface, filesystem access, downloads, hashing, and child-process orchestration are split across a TypeScript frontend and a Rust backend. Steam credentials are handled by DepotDownloader and are never persisted by the launcher.
 
 ## Platform support
 
