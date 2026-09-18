@@ -141,6 +141,7 @@ pub async fn run_operation(
             .steam_language
             .into(),
         auth_method: request.auth_method,
+        launch_command: request.launch_command.clone(),
     };
     let result = async {
         storage::save_preferences(&app, &preferences).await?;
@@ -197,17 +198,23 @@ pub fn cancel_operation(state: State<'_, OperationState>) -> bool {
 }
 
 #[tauri::command]
-pub fn launch_game(install_directory: String) -> AppResult<()> {
+pub fn launch_game(install_directory: String, launch_command: Option<String>) -> AppResult<()> {
     #[cfg(not(windows))]
     {
-        let _ = install_directory;
+        #[cfg(target_os = "linux")]
+        {
+            return launch_linux(&PathBuf::from(install_directory.trim()), launch_command);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (install_directory, launch_command);
         return Err(AppError::message(
-            "Launching is currently supported on Windows only. Proton launch configuration is not implemented yet.",
+            "Launching is currently supported on Windows and Linux.",
         ));
     }
     #[cfg(windows)]
     {
         let root = PathBuf::from(install_directory.trim());
+        let _ = launch_command;
         launch_windows(&root)
     }
 }
@@ -224,5 +231,21 @@ fn launch_windows(root: &Path) -> AppResult<()> {
         .current_dir(root)
         .spawn()
         .map_err(|error| AppError::io("Destiny 2 could not be launched", error))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn launch_linux(root: &Path, launch_command: Option<String>) -> AppResult<()> {
+    let command = launch_command
+        .filter(|command| !command.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::message("Enter a Linux launch command in Settings before launching.")
+        })?;
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .spawn()
+        .map_err(|error| AppError::io("The game launch command could not be started", error))?;
     Ok(())
 }

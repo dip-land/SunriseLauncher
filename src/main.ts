@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { platform } from '@tauri-apps/plugin-os';
 
 type AuthMethod = "qr" | "twoFactor";
 type Preferences = {
@@ -9,6 +10,7 @@ type Preferences = {
   steamUsername: string;
   steamLanguage: string;
   authMethod: AuthMethod;
+  launchCommand?: string;
 };
 type PlatformSupport = {
   os: string;
@@ -69,6 +71,8 @@ const LANGUAGE_LABELS: Record<string, string> = {
   koreana: "Korean",
 };
 
+const currentPlatform = platform();
+
 const languageLabel = (steamLanguage: string) => LANGUAGE_LABELS[steamLanguage] ?? "English";
 
 const element = <T extends HTMLElement>(selector: string): T => {
@@ -78,6 +82,8 @@ const element = <T extends HTMLElement>(selector: string): T => {
 };
 
 const installDirectory = element<HTMLInputElement>("#install-directory");
+const launchCommandLabel = element<HTMLElement>("#launch-command-label");
+const launchCommand = element<HTMLInputElement>("#launch-command");
 const steamUsername = element<HTMLInputElement>("#steam-username");
 const gameLanguage = element<HTMLSelectElement>("#game-language");
 const primaryAction = element<HTMLButtonElement>("#primary-action");
@@ -121,6 +127,7 @@ let setupDraft: Preferences = {
   steamUsername: "",
   steamLanguage: "english",
   authMethod: "qr",
+  launchCommand: "",
 };
 let setupInspection: InstallationSnapshot | null = null;
 let setupLanguageFolder = "";
@@ -166,6 +173,7 @@ const mockSnapshot: AppSnapshot = {
     steamUsername: "",
     steamLanguage: "english",
     authMethod: "qr",
+    launchCommand: "",
   },
   installation: {
     status: "notInstalled",
@@ -380,9 +388,11 @@ async function loadSnapshot(useInputs = false) {
     const data = await invokeCommand<AppSnapshot>("get_app_snapshot");
     if (!useInputs) {
       installDirectory.value = data.preferences.installDirectory;
+      launchCommand.value = data.preferences.launchCommand ?? "";
       steamUsername.value = data.preferences.steamUsername;
     } else if (installDirectory.value !== data.preferences.installDirectory) {
       data.preferences.installDirectory = installDirectory.value;
+      data.preferences.launchCommand = launchCommand.value.trim() || undefined;
       data.preferences.steamUsername = steamUsername.value;
       data.installation = await invokeCommand<InstallationSnapshot>("inspect_installation", {
         installDirectory: installDirectory.value,
@@ -403,6 +413,7 @@ async function saveAndInspect() {
     steamUsername: steamUsername.value.trim(),
     steamLanguage: gameLanguage.value,
     authMethod: snapshot?.preferences.authMethod ?? "qr",
+    launchCommand: launchCommand.value.trim() || undefined,
   };
   try {
     const installation = await invokeCommand<InstallationSnapshot>("inspect_installation", {
@@ -545,6 +556,7 @@ function openSetup() {
     steamUsername: steamUsername.value.trim(),
     steamLanguage: snapshot?.preferences.steamLanguage ?? "english",
     authMethod: snapshot?.preferences.authMethod ?? "qr",
+    launchCommand: launchCommand.value.trim() || undefined,
   };
   setupInspection = snapshot?.installation ?? null;
   setupLanguageFolder = "";
@@ -604,6 +616,7 @@ async function advanceSetup() {
     steamUsername: setupView.dataset.steamUsername ?? setupDraft.steamUsername,
     steamLanguage: setupView.dataset.steamLanguage ?? setupDraft.steamLanguage,
     authMethod: (setupView.dataset.authMethod as AuthMethod | undefined) ?? setupDraft.authMethod,
+    launchCommand: setupDraft.launchCommand,
   };
   installDirectory.value = setupPreferences.installDirectory;
   steamUsername.value = setupPreferences.steamUsername;
@@ -881,6 +894,7 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
     steamUsername: steamUsername.value.trim(),
     steamLanguage: gameLanguage.value,
     authMethod: snapshot?.preferences.authMethod ?? "qr",
+    launchCommand: launchCommand.value.trim() || undefined,
   };
   activeAuthMethod = operationPreferences.authMethod;
   operationRunning = true;
@@ -908,6 +922,7 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
         steamUsername: operationPreferences.steamUsername,
         steamLanguage: operationPreferences.steamLanguage,
         authMethod: operationPreferences.authMethod,
+        launchCommand: operationPreferences.launchCommand,
       },
       onEvent,
     });
@@ -940,6 +955,7 @@ async function runOperation(kind: OperationKind, requestedPreferences?: Preferen
     steamUsername.disabled = false;
     gameLanguage.disabled = false;
     installDirectory.value = operationPreferences.installDirectory;
+    launchCommand.value = operationPreferences.launchCommand ?? "";
     steamUsername.value = operationPreferences.steamUsername;
     gameLanguage.value = operationPreferences.steamLanguage;
     element<HTMLButtonElement>("#browse-directory").disabled = false;
@@ -979,7 +995,10 @@ async function launch() {
   };
 
   try {
-    await invokeCommand("launch_game", { installDirectory: installDirectory.value.trim() });
+    await invokeCommand("launch_game", {
+      installDirectory: installDirectory.value.trim(),
+      launchCommand: launchCommand.value.trim() || undefined,
+    });
     launchGuardTimer = window.setTimeout(finishLaunching, LAUNCH_GUARD_MS);
   } catch (error) {
     finishLaunching();
@@ -995,6 +1014,9 @@ async function closeLauncher() {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  if (currentPlatform === 'windows') {
+    launchCommandLabel.remove();
+  }
   element(".launcher-shell").addEventListener("mousedown", (event) => {
     if (!appWindow || event.button !== 0 || event.buttons !== 1) return;
     const target = event.target;
@@ -1053,6 +1075,9 @@ window.addEventListener("DOMContentLoaded", () => {
   installDirectory.addEventListener("input", () => {
     window.clearTimeout(statusTimer);
     statusTimer = window.setTimeout(saveAndInspect, 450);
+  });
+  launchCommand.addEventListener("change", () => {
+    void saveAndInspect();
   });
   steamUsername.addEventListener("change", saveAndInspect);
   gameLanguage.addEventListener("change", () => {

@@ -113,6 +113,8 @@ pub struct Preferences {
     pub steam_language: String,
     #[serde(default)]
     pub auth_method: AuthMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
 }
 
 impl Default for Preferences {
@@ -122,6 +124,7 @@ impl Default for Preferences {
             steam_username: String::new(),
             steam_language: default_steam_language(),
             auth_method: AuthMethod::default(),
+            launch_command: None,
         }
     }
 }
@@ -276,6 +279,8 @@ pub struct OperationRequest {
     pub steam_language: String,
     #[serde(default)]
     pub auth_method: AuthMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -326,8 +331,10 @@ pub fn current_platform() -> PlatformSupport {
             os,
             arch,
             level: "experimental".into(),
-            can_launch: false,
-            summary: "Native installation is supported; launching through Proton is a follow-up integration.".into(),
+            can_launch: true,
+            summary:
+                "Native installation is supported; launching must be done through a launch command."
+                    .into(),
         },
         "macos" => PlatformSupport {
             os,
