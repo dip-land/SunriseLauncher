@@ -203,6 +203,10 @@ input:focus-visible {
   background: rgba(255, 255, 255, 0.09);
 }
 
+.window-button#window-reload svg {
+    width: 15px;
+}
+
 .window-button.close:hover {
   background: #b8423d;
 }

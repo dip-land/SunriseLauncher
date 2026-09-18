@@ -1005,6 +1005,10 @@ window.addEventListener("DOMContentLoaded", () => {
   element("#settings-action").addEventListener("click", openSettings);
   element("#close-settings").addEventListener("click", closeSettings);
   element("[data-close-settings]").addEventListener("click", closeSettings);
+  element("#window-reload").addEventListener("click", () => {
+    loadSnapshot(true);
+    showToast("Reloaded app.");
+  });
   element("#window-minimize").addEventListener("click", () => appWindow?.minimize());
   element("#window-maximize").addEventListener("click", () => appWindow?.toggleMaximize());
   element("#window-close").addEventListener("click", closeLauncher);
